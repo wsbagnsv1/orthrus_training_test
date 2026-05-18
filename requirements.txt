@@ -1,0 +1,8 @@
+torch>=2.4.0          # Required for FlexAttention and torch.compile
+transformers>=4.45.0
+datasets
+accelerate
+einops
+tqdm
+pyyaml
+wandb                 # Optional logging

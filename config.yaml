@@ -1,0 +1,51 @@
+# Orthrus SmolLM2-135M Training Configuration
+# Based on the Orthrus paper (arXiv:2605.12825, Table 4)
+
+model:
+  base_model: "HuggingFaceTB/SmolLM2-135M-Instruct"
+  K: 32                     # Parallel block size (paper: 32 for all scales)
+  dtype: "bfloat16"
+
+training:
+  max_seq_len: 2048          # Paper: 2048
+  B_blocks: 256                # Paper: 256 for Qwen3 1.7B-8B
+                             # For SmolLM2-135M (smaller), tune empirically
+                             # Start with 8, increase to 32/64/128 as VRAM allows
+  epochs: 2                  # Paper: 2 epochs
+  peak_lr: 2.0e-4            # Paper: 2e-4
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.05         # Paper: 5% warmup
+  gradient_clip: 1.0         # Paper: 1.0
+  micro_batch_size: 4        # Per-GPU; paper uses 1 with 8×H200
+  gradient_accumulation_steps: 8  # Effective batch = 4 × 8 = 32
+  precision: "bfloat16"      # Paper: bfloat16
+  compile: true              # full DiffusionAttention compile (mode=default, fullgraph=False)
+
+  # Logging & checkpointing
+  log_every: 1
+  eval_every: 10
+  acceptance_every: 20
+  save_every: 500
+  output_dir: "./checkpoints"
+
+data:
+  # Single dataset (smoltalk for prototyping)
+  # For smoltalk, config is the sub-dataset name (e.g. 'all', 'metamathqa-50k')
+  dataset: "HuggingFaceTB/smoltalk"
+  dataset_config: "all"        # smoltalk sub-config; set to null for datasets without configs
+  text_key: "text"
+  max_samples: null          # null = all; set to e.g. 100000 for quick prototyping
+  max_eval_samples: 2000     # cap on validation examples
+  eval_split: "test"         # split used for validation
+  min_seq_len: 256
+  mask_token: "<mask>"
+
+  # For multi-dataset (paper uses 1:1:1 Chat:Math:Code), use:
+  # dataset:
+  #   - name: "nvidia/Nemotron-Post-Training-Dataset-v2"
+  #     weight: 1.0
+  #   # Add math + code datasets as available
+
+hardware:
+  device: "cuda"
+  seed: 42
