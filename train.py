@@ -77,7 +77,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "training": {
         "max_seq_len": 2048,
-        "B_blocks": 8,               # paper uses 256 for Qwen3 1.7B-8B; tune for 135M
+        "B_blocks": 256,
         "epochs": 2,
         "peak_lr": 2.0e-4,
         "lr_scheduler": "cosine",
@@ -87,21 +87,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "gradient_accumulation_steps": 8,   # effective batch = 32
         "precision": "bfloat16",
         "compile": True,
-        "log_every": 50,
-        "eval_every": 1000,
-        "acceptance_every": 500,      # measure acceptance rate on held-out set
-        "save_every": 2000,
+        "optimizer": "adamw",      # "adamw" or "muon"
+        "muon_lr_multiplier": 4.0,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "log_every": 1,
+        "eval_every": 10,
+        "acceptance_every": 20,
+        "save_every": 500,
         "output_dir": "./checkpoints",
-        "diffusion_chunk_blocks": 64,  # micro-batch diffusion blocks at a time
+        "diffusion_chunk_blocks": 32,
+        "teacher_bf16": True,
     },
     "data": {
         "dataset": "HuggingFaceTB/smoltalk",
-        "dataset_config": None,       # sub-config for datasets like smoltalk ('all')
+        "dataset_config": "all",
         "text_key": "text",
-        "max_samples": None,          # None = all
-        "max_eval_samples": 2000,     # cap validation set
-        "eval_split": "test",         # validation split name
-        "min_seq_len": 256,
+        "max_samples": None,
+        "max_eval_samples": 2000,
+        "eval_split": "test",
+        "min_seq_len": 512,
         "mask_token": "<mask>",
     },
     "hardware": {
@@ -117,7 +120,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _kl_cache: dict = {}
 
 def _get_kl_indices(B: int, B_blocks: int, K: int, device: torch.device):
-    """Return (diff_pos, batch_idx, offsets) — cached per shape."""
+    """Return (diff_pos, batch_idx, offsets) - cached per shape."""
     key = (B, B_blocks, K)
     if key not in _kl_cache:
         N = B_blocks * (K - 1)
@@ -128,7 +131,7 @@ def _get_kl_indices(B: int, B_blocks: int, K: int, device: torch.device):
         _kl_cache[key] = (diff_pos, batch_idx, offsets)
     diff_pos, batch_idx, offsets = _kl_cache[key]
     # Move to correct device if different
-    if diff_pos.device != device:
+    if diff_pos.device.type != torch.device(device).type:
         _kl_cache.clear()
         return _get_kl_indices(B, B_blocks, K, device)
     return diff_pos, batch_idx, offsets
@@ -142,28 +145,27 @@ def compute_kl_loss(
     K: int,
     target_ids: torch.Tensor,          # [B, B_blocks*K]
     pad_token_id: int,
+    teacher_probs: torch.Tensor | None = None,       # [B, L, vocab] precomputed softmax(lm_head(ar))
+    teacher_ent: torch.Tensor | None = None,         # [B, L] precomputed entropy
 ) -> torch.Tensor:
-    """Chunked KL divergence — gather, lm_head, and kl_div all done in chunks."""
+    """Chunked KL divergence. When teacher_probs/teacher_ent are provided,
+    skips lm_head(ar_hidden) - saves ~50% of lm_head calls."""
     B, B_blocks = anchor_positions.shape
     device = diff_hidden.device
     L = ar_hidden_states.shape[1]
     N = B_blocks * (K - 1)
 
     diff_pos, batch_idx, offsets = _get_kl_indices(B, B_blocks, K, device)
-
-    # AR positions: a_b + k for k=1..K-1 (teacher at a_b+k-1, predicts a_b+k)
     ar_pos = (anchor_positions.unsqueeze(-1) + offsets).view(B, N).clamp(0, L - 1)
 
-    # Padding mask (small: [B, N])
-    tgt = target_ids[batch_idx, diff_pos]                  # [B, N]
-    valid = (tgt != pad_token_id)                           # [B, N]
-
+    tgt = target_ids[batch_idx, diff_pos]
+    valid = (tgt != pad_token_id)
     total_tokens = valid.sum().float()
     if total_tokens == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # Chunked gather + lm_head + KL to avoid [B, N, vocab] intermediates
-    CHUNK = 1024  # process 1024 positions at a time
+    use_precomputed = teacher_probs is not None and teacher_ent is not None
+    CHUNK = 2048  # bf16 = half memory, can double chunk size
     total_kl = 0.0
 
     for c in range(0, N, CHUNK):
@@ -172,51 +174,67 @@ def compute_kl_loss(
         if not chunk_valid.any():
             continue
 
-        # Slice both index tensors to the same chunk
-        b_idx = batch_idx[:, c:c_end]      # [B, chunk]
-        d_idx = diff_pos[:, c:c_end]       # [B, chunk]
-        a_idx = ar_pos[:, c:c_end]         # [B, chunk]
-
-        # Gather only this chunk's positions (hidden states, defer lm_head)
-        d_hidden_chunk = diff_hidden[b_idx, d_idx]         # [B, chunk, D]
-        ar_hidden_chunk = ar_hidden_states[b_idx, a_idx]   # [B, chunk, D]
-
-        # Apply lm_head to the small chunk only
-        d_logits_chunk = lm_head(d_hidden_chunk).float()            # [B, chunk, vocab]
+        b_idx = batch_idx[:, c:c_end]
+        d_idx = diff_pos[:, c:c_end]
+        a_idx = ar_pos[:, c:c_end]
 
         with torch.no_grad():
-            teacher_logits = lm_head(ar_hidden_chunk).float()
-            p_teacher = F.softmax(teacher_logits, dim=-1)
-            # KL(P||Q) = CE(P, Q) - H(P).  Teacher entropy has zero grad
-            teacher_entropy = -(p_teacher * F.log_softmax(teacher_logits, dim=-1)).sum(dim=-1)
+            if use_precomputed:
+                p_t_chunk = teacher_probs[b_idx, a_idx]
+                ent_chunk = teacher_ent[b_idx, a_idx]
+            else:
+                ar_hidden_chunk = ar_hidden_states[b_idx, a_idx]
+                teacher_logits = lm_head(ar_hidden_chunk).float()
+                p_t_chunk = F.softmax(teacher_logits, dim=-1)
+                ent_chunk = -(p_t_chunk * F.log_softmax(teacher_logits, dim=-1)).sum(dim=-1)
 
-        # Fused cross-entropy kernel — avoids materializing student log_softmax
-        chunk_ce = F.cross_entropy(
-            d_logits_chunk.view(-1, d_logits_chunk.size(-1)),
-            p_teacher.view(-1, p_teacher.size(-1)),
-            reduction='none',
-        ).view(B, -1)
-
-        chunk_kl = chunk_ce - teacher_entropy
-        total_kl += (chunk_kl * chunk_valid).sum()
-
-        del d_hidden_chunk, ar_hidden_chunk, d_logits_chunk, teacher_logits, p_teacher, chunk_ce, chunk_kl
+        total_kl += _kl_chunk_body(diff_hidden, b_idx, d_idx, p_t_chunk, ent_chunk, chunk_valid, lm_head, B)
 
     return total_kl / total_tokens
 
 
-# ── JSONL metrics logger ────────────────────────────────────────────────────
+@torch.compile(mode="default", fullgraph=False, dynamic=True)
+def _kl_chunk_body(diff_hidden, b_idx, d_idx, p_t_chunk, ent_chunk, chunk_valid, lm_head, B):
+    """Compiled inner body: gather → lm_head → cross_entropy → weighted sum."""
+    d_hidden_chunk = diff_hidden[b_idx, d_idx]
+    d_logits_chunk = lm_head(d_hidden_chunk)
+    # bf16 cross_entropy (fast Tensor core) → fp32 for KL accumulation (accurate gradients)
+    chunk_ce = F.cross_entropy(
+        d_logits_chunk.view(-1, d_logits_chunk.size(-1)),
+        p_t_chunk.view(-1, p_t_chunk.size(-1)),
+        reduction='none',
+    ).view(B, -1)
+    chunk_kl = chunk_ce.float() - ent_chunk.float()
+    return (chunk_kl * chunk_valid.float()).sum()
 
-_metrics_file = None
+
+# ── JSONL metrics logger (async via background thread) ──────────────────────
+
+import threading, queue
+_metrics_queue: queue.Queue | None = None
+_metrics_thread: threading.Thread | None = None
+_metrics_done = threading.Event()
+
+def _metrics_worker():
+    while not _metrics_done.is_set():
+        try:
+            entry = _metrics_queue.get(timeout=1.0)
+            with open(_metrics_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except queue.Empty:
+            continue
 
 def set_metrics_file(path):
-    global _metrics_file
+    global _metrics_file, _metrics_queue, _metrics_thread
     _metrics_file = path
+    _metrics_queue = queue.Queue()
+    _metrics_thread = threading.Thread(target=_metrics_worker, daemon=True)
+    _metrics_thread.start()
 
 def log_metrics(step, loss, val_kl=None, accept_rate=None, lr=None, grad_norm=None):
-    if not _metrics_file:
+    if not _metrics_queue:
         return
-    entry = {
+    _metrics_queue.put({
         "step": int(step),
         "loss": float(loss) if hasattr(loss, 'item') else loss,
         "val_kl": float(val_kl) if val_kl is not None and hasattr(val_kl, 'item') else val_kl,
@@ -224,9 +242,7 @@ def log_metrics(step, loss, val_kl=None, accept_rate=None, lr=None, grad_norm=No
         "lr": float(lr) if lr is not None else lr,
         "grad_norm": float(grad_norm) if grad_norm is not None and hasattr(grad_norm, 'item') else grad_norm,
         "time": time.time(),
-    }
-    with open(_metrics_file, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    })
 
 
 # ── main training function ───────────────────────────────────────────────────
@@ -248,7 +264,7 @@ def train(config: Dict[str, Any]):
     _interrupted = [False]  # mutable so inner closure can set it
     def _on_interrupt(signum, frame):
         _interrupted[0] = True
-        print("\n\n⚠ Ctrl+C received — will save checkpoint after current step...")
+        print("\n\n⚠ Ctrl+C received - will save checkpoint after current step...")
     signal.signal(signal.SIGINT, _on_interrupt)
 
     # ── tokenizer & <mask> token ─────────────────────────────────────────────
@@ -308,7 +324,7 @@ def train(config: Dict[str, Any]):
             )
             print(f"  Validation split: '{val_split}' → {len(val_ds)} examples")
         except Exception:
-            print(f"  No '{val_split}' split found — eval will sample from train set")
+            print(f"  No '{val_split}' split found - eval will sample from train set")
             val_ds = None
 
     # Pre-tokenize all datasets (tokenizer runs once, not every batch)
@@ -361,7 +377,43 @@ def train(config: Dict[str, Any]):
 
     # ── optimizer & scheduler ────────────────────────────────────────────────
     trainable_params = model.get_trainable_params()
-    optimizer = AdamW(trainable_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95))
+
+    optimizer_type = config["training"].get("optimizer", "adamw").lower()
+    optimizers = []
+
+    if optimizer_type == "muon":
+        try:
+            from muon import Muon
+        except ImportError:
+            print("  ⚠ Muon not installed — falling back to AdamW")
+            optimizer_type = "adamw"
+        # Muon requires torch.distributed; init dummy group for single GPU
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "29500")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            dist.init_process_group(backend="gloo", rank=0, world_size=1)
+
+    if optimizer_type == "muon":
+        proj_params, norm_params = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
+                proj_params.append(p)
+            else:
+                norm_params.append(p)
+        optimizers.append(Muon(proj_params, lr=config["training"]["peak_lr"] * config["training"].get("muon_lr_multiplier", 4.0), weight_decay=0.0))
+        if norm_params:
+            optimizers.append(AdamW(norm_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=0.0))
+        print(f"  Optimizers: Muon (proj) + AdamW (norms)")
+    else:
+        optimizers.append(AdamW(trainable_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=0.0))
+        print(f"  Optimizer: AdamW")
+
+    optimizer = optimizers[0]  # canonical ref for save/load/scheduler
 
     total_steps = (
         len(dataloader) // config["training"]["gradient_accumulation_steps"]
@@ -369,10 +421,23 @@ def train(config: Dict[str, Any]):
     )
     warmup_steps = int(total_steps * config["training"]["warmup_ratio"])
 
-    warmup = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, warmup_steps))
-    cosine = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+    import math
+    peak_lr = config["training"]["peak_lr"]
+    def _lr_fn(step):
+        if step < warmup_steps:
+            frac = step / warmup_steps
+            return (1e-3 + (1.0 - 1e-3) * frac)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
+    # Set initial LR on all optimizers
+    for opt in optimizers:
+        for pg in opt.param_groups:
+            pg['lr'] = peak_lr * _lr_fn(0)
+    # Scheduler uses the canonical optimizer
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn)
+
+    config["training"]["_total_steps"] = total_steps
     print(f"  Total steps: {total_steps} (warmup: {warmup_steps})")
     print(f"  Effective batch size: "
           f"{config['training']['micro_batch_size'] * config['training']['gradient_accumulation_steps']}")
@@ -380,23 +445,56 @@ def train(config: Dict[str, Any]):
     # ── resume ───────────────────────────────────────────────────────────────
     start_epoch = 0
     global_step = 0
+    schedule_step = 0  # tracks LR schedule position (may differ on batch-size change)
     resume_from = config["training"].get("resume_from")
     if resume_from:
-        start_epoch, global_step = load_checkpoint(model, optimizer, scheduler, resume_from)
+        start_epoch, global_step = load_checkpoint(model, optimizer, scheduler, resume_from, optimizers=optimizers)
+        # Rebuild scheduler with current config LR (checkpoint LR may differ)
+        # Also check saved schedule metadata in case batch size / total steps changed
+        schedule_step = global_step  # default: no remapping needed
+        meta_path = os.path.join(resume_from, "schedule_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            old_total = meta.get("total_steps", 0)
+            if old_total and old_total != total_steps:
+                print(f"  ⚠ Schedule changed: old total_steps={old_total} → new={total_steps}")
+                # Re-map progress to new schedule so LR stays proportional
+                old_warmup = int(old_total * config["training"]["warmup_ratio"])
+                if global_step < old_warmup:
+                    frac = global_step / max(1, old_warmup)
+                    schedule_step = max(0, int(warmup_steps * frac) - 1)
+                else:
+                    progress = (global_step - old_warmup) / max(1, old_total - old_warmup)
+                    schedule_step = warmup_steps + int((total_steps - warmup_steps) * progress)
+                print(f"  → LR schedule mapped: global_step={global_step} → schedule_step={schedule_step}")
+        # Rebuild scheduler + LR on all optimizers
+        for opt in optimizers:
+            for pg in opt.param_groups:
+                pg['lr'] = peak_lr
+                pg['initial_lr'] = peak_lr
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn, last_epoch=schedule_step)
+        current_lr = peak_lr * _lr_fn(schedule_step)
+        print(f"  Rebuilt scheduler: peak={peak_lr:.2e} "
+              f"schedule_step={schedule_step} LR={current_lr:.2e}")
 
     # Compile after loading weights (so trained parameters aren't lost)
     if config["training"]["compile"]:
         model.compile_diffusion_heads()
 
     # ── training loop ────────────────────────────────────────────────────────
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))  # fp16 needs scaling, bf16 doesn't
+    use_scaler = (dtype == torch.float16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)  # fp16 needs scaling, bf16 doesn't
     accum_loss = 0.0
+    _profile_step = global_step + 3  # print detailed breakdown 3 steps after resume/ start
 
     def _save_crash_checkpoint(tag="crash"):
         try:
             save_checkpoint(
                 model, optimizer, scheduler, global_step, epoch,
                 config["training"]["output_dir"], tag,
+                total_steps=total_steps,
+                optimizers=optimizers,
             )
             print(f"\n  💾 Crash checkpoint saved → "
                   f"{config['training']['output_dir']}/{tag}")
@@ -422,30 +520,67 @@ def train(config: Dict[str, Any]):
                 anchor_positions = batch["anchor_positions"].to(device)
                 target_ids = batch["target_ids"].to(device)
                 causal_limit = batch["causal_limit"].to(device)
-    
+
                 B = ar_input_ids.shape[0]
                 L = ar_input_ids.shape[1]
                 K = config["model"]["K"]
                 B_blocks_total = anchor_positions.shape[1]
-    
+
                 # Compute actual AR sequence length (non-padding) per batch item
                 ar_seq_len = ar_attention_mask.sum(dim=1).max().item()
                 ar_input_ids = ar_input_ids[:, :ar_seq_len]
                 ar_attention_mask = ar_attention_mask[:, :ar_seq_len]
-    
-                # Step 1: AR prefill (frozen, no grad) — run ONCE per batch
+
+                # Step 1: AR prefill (frozen, no grad) - run ONCE per batch
+                _profile = (global_step == _profile_step - 1)
+                _t0 = time.perf_counter() if _profile else 0
                 with torch.no_grad():
                     ar_kv_cache, ar_hidden = model.forward_ar_prefill(
                         ar_input_ids, ar_attention_mask
                     )
-    
-                # Step 2+3: Diffusion micro-batching — each chunk of blocks
+                if _profile: torch.cuda.synchronize(); _t_ar = (time.perf_counter() - _t0) * 1000
+
+                # Precompute teacher probs once per batch (chunked by L to save VRAM)
+                with torch.no_grad():
+                    CHUNK_L = 512
+                    tp_list, te_list = [], []
+                    for s in range(0, ar_seq_len, CHUNK_L):
+                        e = min(s + CHUNK_L, ar_seq_len)
+                        ar_logits = model.lm_head(ar_hidden[:, s:e]).float()
+                        log_p = F.log_softmax(ar_logits, dim=-1)
+                        p = torch.exp(log_p)
+                        te_chunk = -(p * log_p).sum(dim=-1)
+                        if config["training"].get("teacher_bf16", False):
+                            tp_list.append(p.to(torch.bfloat16))
+                            te_list.append(te_chunk.to(torch.bfloat16))
+                        else:
+                            tp_list.append(p)
+                            te_list.append(te_chunk)
+                        del ar_logits, log_p, p
+                    teacher_probs = torch.cat(tp_list, dim=1)
+                    teacher_ent = torch.cat(te_list, dim=1)
+
+                # Precompute per-token valid mask so token-count weighting is
+                # invariant to chunk size (avoids KL drift from uneven padding)
+                _diff_pos, _batch_idx, _ = _get_kl_indices(B, B_blocks_total, K, target_ids.device)
+                total_valid_mask = (
+                    target_ids[_batch_idx, _diff_pos] != pad_token_id
+                )  # [B, B_blocks_total * (K-1)]
+                total_valid_tokens = total_valid_mask.sum().float()
+
+                # Step 2+3: Diffusion micro-batching - each chunk of blocks
                 # runs forward + backward independently, freeing activations
                 batch_loss = 0.0
+                _t_fwd = _t_kl = _t_bwd = 0.0
                 for blk_start in range(0, B_blocks_total, diff_chunk_blocks):
                     blk_end = min(blk_start + diff_chunk_blocks, B_blocks_total)
                     n_blocks = blk_end - blk_start
-    
+
+                    # Token-count weight for this chunk (invariant to chunk size)
+                    n_start = blk_start * (K - 1)
+                    n_end = blk_end * (K - 1)
+                    chunk_valid_tokens = total_valid_mask[:, n_start:n_end].sum().float()
+
                     # Slice inputs for this chunk of blocks
                     tok_start = blk_start * K
                     tok_end = blk_end * K
@@ -453,11 +588,12 @@ def train(config: Dict[str, Any]):
                     chunk_causal = causal_limit[:, tok_start:tok_end]
                     chunk_anchor = anchor_positions[:, blk_start:blk_end]
                     chunk_target = target_ids[:, tok_start:tok_end]
-    
+
                     # RoPE positions: token at anchor b + k encodes position a_b + k
                     offsets = torch.arange(K, device=device)  # [0, 1, ..., K-1]
                     chunk_positions = (chunk_anchor.unsqueeze(-1) + offsets).view(B, -1)
-    
+
+                    if _profile: torch.cuda.synchronize(); _tf0 = time.perf_counter()
                     diff_hidden = model.forward_diffusion(
                         diff_input_ids=chunk_diff_ids,
                         ar_past_key_values=ar_kv_cache,
@@ -466,7 +602,9 @@ def train(config: Dict[str, Any]):
                         return_hidden=True,
                         diff_position_ids=chunk_positions,
                     )
-    
+                    if _profile: torch.cuda.synchronize(); _t_fwd += (time.perf_counter() - _tf0) * 1000
+
+                    if _profile: torch.cuda.synchronize(); _tk0 = time.perf_counter()
                     chunk_loss = compute_kl_loss(
                         diff_hidden=diff_hidden,
                         ar_hidden_states=ar_hidden,
@@ -475,33 +613,71 @@ def train(config: Dict[str, Any]):
                         K=K,
                         target_ids=chunk_target,
                         pad_token_id=pad_token_id,
+                        teacher_probs=teacher_probs,
+                        teacher_ent=teacher_ent,
                     )
-    
-                    # Weight by chunk size so total loss matches unchunked version
-                    weight = n_blocks / B_blocks_total
+                    if _profile: torch.cuda.synchronize(); _t_kl += (time.perf_counter() - _tk0) * 1000
+
+                    # Weight by actual valid token count - invariant to chunk size
+                    if total_valid_tokens > 0 and chunk_valid_tokens > 0:
+                        weight = chunk_valid_tokens / total_valid_tokens
+                    else:
+                        weight = 0.0
                     scaled_loss = (chunk_loss * weight) / config["training"]["gradient_accumulation_steps"]
-    
-                    # Backward immediately — frees diffusion activations for this chunk
-                    scaler.scale(scaled_loss).backward()
+
+                    # Backward immediately - frees diffusion activations for this chunk
+                    if _profile: torch.cuda.synchronize(); _tb0 = time.perf_counter()
+                    if use_scaler:
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+                    if _profile: torch.cuda.synchronize(); _t_bwd += (time.perf_counter() - _tb0) * 1000
                     batch_loss += chunk_loss.item() * weight
-    
+
                 accum_loss += batch_loss
-    
+
                 # Free AR intermediates
                 del ar_hidden, ar_kv_cache
-    
+
                 if (batch_idx + 1) % config["training"]["gradient_accumulation_steps"] == 0:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        trainable_params, max_norm=config["training"]["gradient_clip"]
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if use_scaler:
+                        scaler.unscale_(optimizer)
+                    # Clip + step all optimizers
+                    grad_norms = []
+                    for opt in optimizers:
+                        gn = torch.nn.utils.clip_grad_norm_(
+                            [p for pg in opt.param_groups for p in pg['params']],
+                            max_norm=config["training"]["gradient_clip"]
+                        )
+                        grad_norms.append(gn.item() if gn is not None else 0.0)
+                    grad_norm = max(grad_norms)
+
+                    if use_scaler:
+                        for opt in optimizers:
+                            scaler.step(opt)
+                        scaler.update()
+                    else:
+                        for opt in optimizers:
+                            opt.step()
+
                     scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-    
+                    for opt in optimizers:
+                        opt.zero_grad(set_to_none=True)
+
                     global_step += 1
-    
+                    schedule_step += 1
+
+                    if global_step == _profile_step:
+                        _t_opt = 0  # approximate: zero_grad + optimizer included
+                        _total = _t_ar + _t_fwd + _t_kl + _t_bwd
+                        print(f"\n  ═══ Step {global_step} breakdown ═══")
+                        print(f"  AR prefill:       {_t_ar:7.1f} ms  ({_t_ar/_total*100:4.1f}%)")
+                        print(f"  Diffusion fwd:    {_t_fwd:7.1f} ms  ({_t_fwd/_total*100:4.1f}%)")
+                        print(f"  KL loss:          {_t_kl:7.1f} ms  ({_t_kl/_total*100:4.1f}%)")
+                        print(f"  Backward:         {_t_bwd:7.1f} ms  ({_t_bwd/_total*100:4.1f}%)")
+                        print(f"  ──────────────────────────")
+                        print(f"  Total step:       {_total:7.0f} ms  ({_total/1000:.2f}s, {1000/_total:.1f} it/s)")
+
                     # ── Ctrl+C interrupt check ─────────────────────────────────
                     if _interrupted[0]:
                         print(f"\n⚠ Interrupted at step {global_step}. Saving checkpoint...")
@@ -509,11 +685,13 @@ def train(config: Dict[str, Any]):
                             model, optimizer, scheduler, global_step, epoch,
                             config["training"]["output_dir"],
                             f"interrupt_step_{global_step}",
+                            total_steps=total_steps,
+                            optimizers=optimizers,
                         )
                         print("✓ Saved. Resume with:")
                         print(f"  --resume {config['training']['output_dir']}/interrupt_step_{global_step}")
                         return model
-    
+
                     # ── logging ─────────────────────────────────────────────────
                     if global_step % config["training"]["log_every"] == 0:
                         lr = scheduler.get_last_lr()[0]
@@ -525,21 +703,24 @@ def train(config: Dict[str, Any]):
                         )
                         log_metrics(global_step, avg_loss, lr=lr, grad_norm=grad_norm)
                         accum_loss = 0.0
-    
+
                     # ── checkpoint ──────────────────────────────────────────────
                     if global_step % config["training"]["save_every"] == 0:
                         save_checkpoint(
                             model, optimizer, scheduler, global_step, epoch,
                             config["training"]["output_dir"],
                             f"step_{global_step}",
+                            total_steps=total_steps,
+                            optimizers=optimizers,
                         )
-    
+
                     # ── eval ───────────────────────────────────────────────────
                     if global_step % config["training"]["eval_every"] == 0:
                         eval_dl = val_dataloader if val_dataloader is not None else dataloader
                         eval_loss = evaluate(
                             model, eval_dl, pad_token_id, device, dtype,
                             max_eval_batches=10,
+                            diff_chunk_blocks=config["training"].get("diffusion_chunk_blocks", 16),
                         )
                         pbar.write(
                             f"  >>> Eval  @ step {global_step:6d} | "
@@ -547,7 +728,7 @@ def train(config: Dict[str, Any]):
                             f"{' (val)' if val_dataloader is not None else ' (train)'} <<<"
                         )
                         log_metrics(global_step, eval_loss, val_kl=eval_loss)
-    
+
                     # ── acceptance rate ────────────────────────────────────────
                     if config["training"].get("acceptance_every") and \
                        global_step % config["training"]["acceptance_every"] == 0:
@@ -574,7 +755,7 @@ def train(config: Dict[str, Any]):
                             f"blocks: {acc_stats['num_blocks']}{off_str} <<<"
                         )
                         log_metrics(global_step, None, accept_rate=acc_stats['acceptance_rate'])
-    
+
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
@@ -589,13 +770,15 @@ def train(config: Dict[str, Any]):
     save_checkpoint(
         model, optimizer, scheduler, global_step, epoch,
         config["training"]["output_dir"], "final",
+        total_steps=total_steps,
+        optimizers=optimizers,
     )
     print(f"\n✓ Training complete. Final checkpoint saved to "
           f"{os.path.join(config['training']['output_dir'], 'final')}")
     return model
 
 
-def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name):
+def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name, total_steps=None, optimizers=None):
     """Save full training state for resumption."""
     ckpt_dir = os.path.join(output_dir, name)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -609,16 +792,25 @@ def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name):
         {k: v for k, v in raw_state.items() if "diffusion_heads" in k},
         os.path.join(ckpt_dir, "diffusion_heads.pt"),
     )
+    # Save optimizer(s)
+    if optimizers is not None and len(optimizers) > 1:
+        opt_states = {i: opt.state_dict() for i, opt in enumerate(optimizers)}
+    else:
+        opt_states = optimizer.state_dict()
     torch.save({
-        "optimizer": optimizer.state_dict(),
+        "optimizer": opt_states,
         "scheduler": scheduler.state_dict(),
         "step": step,
         "epoch": epoch,
     }, os.path.join(ckpt_dir, "trainer_state.pt"))
+    # Save a sidecar with schedule metadata so batch-size changes can be handled
+    if total_steps is not None:
+        with open(os.path.join(ckpt_dir, "schedule_meta.json"), "w") as f:
+            json.dump({"total_steps": total_steps}, f)
     print(f"\n  ✓ Checkpoint saved to {ckpt_dir}")
 
 
-def load_checkpoint(model, optimizer, scheduler, ckpt_dir):
+def load_checkpoint(model, optimizer, scheduler, ckpt_dir, optimizers=None):
     """Load full training state and return (start_epoch, global_step)."""
     state = torch.load(os.path.join(ckpt_dir, "trainer_state.pt"), map_location="cpu")
     weights = torch.load(os.path.join(ckpt_dir, "diffusion_heads.pt"), map_location="cpu")
@@ -629,13 +821,22 @@ def load_checkpoint(model, optimizer, scheduler, ckpt_dir):
         print(f"  ⚠ {len(diff_missing)} diffusion_head keys missing (reverting to copy-init)")
     print(f"  ✓ Resumed from {ckpt_dir} (step {state['step']}, epoch {state['epoch']}) "
           f"[{len(clean_weights)} weights loaded]")
-    optimizer.load_state_dict(state["optimizer"])
-    scheduler.load_state_dict(state["scheduler"])
+    # Load optimizer(s)
+    opt_state = state["optimizer"]
+    if isinstance(opt_state, dict) and any(str(k).isdigit() for k in opt_state):
+        # Multiple optimizers saved as {0: state, 1: state}
+        if optimizers is not None:
+            for i, opt in enumerate(optimizers):
+                opt.load_state_dict(opt_state[str(i)])
+    else:
+        optimizer.load_state_dict(opt_state)
+    # scheduler rebuilt from config - don't load stale LR
     return state["epoch"], state["step"]
 
 
-@torch.inference_mode()
-def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10):
+
+@torch.no_grad()
+def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10, diff_chunk_blocks=16):
     """Run KL loss on a few batches and return average."""
     model.eval()
     total_loss = 0.0
@@ -654,28 +855,56 @@ def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10
         ar_attention_mask = ar_attention_mask[:, :ar_seq_len]
 
         ar_kv_cache, ar_hidden = model.forward_ar_prefill(ar_input_ids, ar_attention_mask)
+
+        # Precompute teacher probs (chunked by L to save VRAM)
+        CHUNK_L = 512; tp_list, te_list = [], []
+        for s in range(0, ar_seq_len, CHUNK_L):
+            e = min(s + CHUNK_L, ar_seq_len)
+            ar_logits = model.lm_head(ar_hidden[:, s:e]).float()
+            log_p = F.log_softmax(ar_logits, dim=-1)
+            p = torch.exp(log_p)
+            te_chunk = -(p * log_p).sum(dim=-1)
+            tp_list.append(p.to(torch.bfloat16) if config["training"].get("teacher_bf16", False) else p)
+            te_list.append(te_chunk.to(torch.bfloat16) if config["training"].get("teacher_bf16", False) else te_chunk)
+            del ar_logits, log_p, p
+        teacher_probs = torch.cat(tp_list, dim=1)
+        teacher_ent = torch.cat(te_list, dim=1)
+
         K = model.block_size
-        offsets = torch.arange(K, device=device)
-        eval_positions = (anchor_positions.unsqueeze(-1) + offsets).view(
-            ar_input_ids.shape[0], -1)
-        diff_hidden = model.forward_diffusion(
-            diff_input_ids=diff_input_ids,
-            ar_past_key_values=ar_kv_cache,
-            ar_seq_len=ar_seq_len,
-            causal_limit=causal_limit,
-            return_hidden=True,
-            diff_position_ids=eval_positions,
-        )
-        loss = compute_kl_loss(diff_hidden, ar_hidden, model.lm_head,
-                              anchor_positions, model.block_size,
-                              target_ids, pad_token_id)
-        total_loss += loss.item()
+        diff_chunk_blocks_inner = diff_chunk_blocks
+        B_blocks_total = anchor_positions.shape[1]
+        B = ar_input_ids.shape[0]
+
+        chunk_losses = []
+        for blk_start in range(0, B_blocks_total, diff_chunk_blocks_inner):
+            blk_end = min(blk_start + diff_chunk_blocks_inner, B_blocks_total)
+            n_blocks = blk_end - blk_start
+            tok_start, tok_end = blk_start * K, blk_end * K
+
+            chunk_positions = (anchor_positions[:, blk_start:blk_end].unsqueeze(-1) + torch.arange(K, device=device)).view(B, -1)
+            diff_hidden = model.forward_diffusion(
+                diff_input_ids=diff_input_ids[:, tok_start:tok_end],
+                ar_past_key_values=ar_kv_cache,
+                ar_seq_len=ar_seq_len,
+                causal_limit=causal_limit[:, tok_start:tok_end],
+                return_hidden=True,
+                diff_position_ids=chunk_positions,
+            )
+            chunk_loss = compute_kl_loss(diff_hidden, ar_hidden, model.lm_head,
+                                          anchor_positions[:, blk_start:blk_end], K,
+                                          target_ids[:, tok_start:tok_end], pad_token_id,
+                                          teacher_probs=teacher_probs,
+                                          teacher_ent=teacher_ent)
+            chunk_losses.append(chunk_loss.item() * n_blocks)
+            del diff_hidden
+
+        total_loss += sum(chunk_losses) / B_blocks_total
         total_tokens += 1
     model.train()
     return total_loss / max(total_tokens, 1)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_acceptance_rate(
     model, tokenizer, val_dataloader, device, dtype,
     max_examples=8, max_tokens_per_example=64,
@@ -683,7 +912,7 @@ def evaluate_acceptance_rate(
     """
     Run consensus generation on held-out examples and measure acceptance rate.
 
-    This is the key metric from the Orthrus paper — higher acceptance → higher TPF.
+    This is the key metric from the Orthrus paper - higher acceptance → higher TPF.
     Targets: >50% early, >85% at convergence.
     """
     model.eval()
@@ -743,9 +972,8 @@ def evaluate_acceptance_rate(
 
                     # Causal limit
                     causal_limit = torch.zeros(1, diff_len, dtype=torch.long, device=device)
-                    causal_limit[0, 0] = current_len - 1
-                    for k in range(1, diff_len):
-                        causal_limit[0, k] = current_len + k - 1
+                    for k in range(diff_len):
+                        causal_limit[0, k] = current_len - 1  # match training: mask sees AR only before anchor
 
                     # Diffusion projection (1 forward pass)
                     diff_logits = model.forward_diffusion(
@@ -802,7 +1030,9 @@ def evaluate_acceptance_rate(
         return {"acceptance_rate": 0.0, "avg_acceptance_len": 0.0, "offset_rates": []}
 
     avg_accept_len = sum(total_acceptances) / len(total_acceptances)
-    accept_rate = avg_accept_len / K
+    # Exclude anchor from rate: anchor is always accepted, so floor is 1.0
+    # Rate = fraction of K-1 predicted tokens that were accepted
+    accept_rate = max(0, avg_accept_len - 1) / (K - 1)
     tpf = total_tokens_gen / max(total_passes, 1)
     return {
         "acceptance_rate": accept_rate,
@@ -830,6 +1060,8 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accum", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--compile", type=str, default=None)  # "true"/"false"
+    parser.add_argument("--optimizer", type=str, default=None)  # "adamw" or "muon"
+    parser.add_argument("--muon_lr", type=float, default=None)  # muon_lr_multiplier
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint dir to resume from")
     args = parser.parse_args()
@@ -861,6 +1093,8 @@ if __name__ == "__main__":
         "batch_size": ("training", "micro_batch_size"),
         "grad_accum": ("training", "gradient_accumulation_steps"),
         "output_dir": ("training", "output_dir"),
+        "optimizer": ("training", "optimizer"),
+        "muon_lr": ("training", "muon_lr_multiplier"),
         "dataset": ("data", "dataset"),
         "dataset_config": ("data", "dataset_config"),
     }
