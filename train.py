@@ -88,7 +88,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "precision": "bfloat16",
         "compile": True,
         "optimizer": "adamw",      # "adamw" or "muon"
-        "muon_lr_multiplier": 50,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "muon_lr_multiplier": 66.67,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
         "weight_decay": 0.01,       # AdamW weight decay (also applies to norm params under Muon)
         "muon_weight_decay": 0.01,  # Muon weight decay (recommended 0.01–0.1)
         "log_every": 1,
