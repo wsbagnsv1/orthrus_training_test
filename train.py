@@ -81,14 +81,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "epochs": 2,
         "peak_lr": 2.0e-4,
         "lr_scheduler": "cosine",
-        "warmup_ratio": 0.05,
+        "warmup_ratio": 0.01,
         "gradient_clip": 1.0,
         "micro_batch_size": 4,
         "gradient_accumulation_steps": 8,   # effective batch = 32
         "precision": "bfloat16",
         "compile": True,
         "optimizer": "adamw",      # "adamw" or "muon"
-        "muon_lr_multiplier": 66.7,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "muon_lr_multiplier": 50,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "weight_decay": 0.01,       # AdamW weight decay (also applies to norm params under Muon)
+        "muon_weight_decay": 0.01,  # Muon weight decay (recommended 0.01–0.1)
         "log_every": 1,
         "eval_every": 10,
         "acceptance_every": 20,
@@ -405,12 +407,14 @@ def train(config: Dict[str, Any]):
                 proj_params.append(p)
             else:
                 norm_params.append(p)
-        optimizers.append(Muon(proj_params, lr=config["training"]["peak_lr"] * config["training"].get("muon_lr_multiplier", 4.0), weight_decay=0.0))
+        muon_wd = config["training"].get("muon_weight_decay", 0.01)
+        adamw_wd = config["training"].get("weight_decay", 0.01)
+        optimizers.append(Muon(proj_params, lr=config["training"]["peak_lr"] * config["training"].get("muon_lr_multiplier", 4.0), weight_decay=muon_wd))
         if norm_params:
-            optimizers.append(AdamW(norm_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=0.0))
+            optimizers.append(AdamW(norm_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=adamw_wd))
         print(f"  Optimizers: Muon (proj) + AdamW (norms)")
     else:
-        optimizers.append(AdamW(trainable_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=0.0))
+        optimizers.append(AdamW(trainable_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=config["training"].get("weight_decay", 0.01)))
         print(f"  Optimizer: AdamW")
 
     optimizer = optimizers[0]  # canonical ref for save/load/scheduler
@@ -470,11 +474,16 @@ def train(config: Dict[str, Any]):
                 print(f"  → LR schedule mapped: global_step={global_step} → schedule_step={schedule_step}")
         # Rebuild scheduler + LR on all optimizers
         muon_mult = config["training"].get("muon_lr_multiplier", 4.0)
+        muon_wd = config["training"].get("muon_weight_decay", 0.01)
+        adamw_wd = config["training"].get("weight_decay", 0.01)
         for i, opt in enumerate(optimizers):
-            lr = peak_lr * muon_mult if (optimizer_type == "muon" and i == 0) else peak_lr
+            is_muon = (optimizer_type == "muon" and i == 0)
+            lr = peak_lr * muon_mult if is_muon else peak_lr
+            wd = muon_wd if is_muon else adamw_wd
             for pg in opt.param_groups:
                 pg['lr'] = lr
                 pg['initial_lr'] = lr
+                pg['weight_decay'] = wd
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn, last_epoch=schedule_step)
         current_lr = peak_lr * muon_mult * _lr_fn(schedule_step) if optimizer_type == "muon" else peak_lr * _lr_fn(schedule_step)
         print(f"  Rebuilt scheduler: peak={peak_lr:.2e} "
