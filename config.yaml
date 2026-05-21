@@ -19,7 +19,7 @@ training:
   precision: "bfloat16"
   compile: true
   optimizer: "adamw"          # "adamw" or "muon"
-  muon_lr_multiplier: 50     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+  muon_lr_multiplier: 66.67     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
   weight_decay: 0.01         # AdamW weight decay (norms under Muon)
   muon_weight_decay: 0.01    # Muon weight decay (paper recommends 0.01–0.1)
   diffusion_chunk_blocks: 32  # spatial micro-batching
