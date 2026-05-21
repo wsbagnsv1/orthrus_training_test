@@ -19,7 +19,7 @@ training:
   precision: "bfloat16"
   compile: true
   optimizer: "adamw"          # "adamw" or "muon"
-  muon_lr_multiplier: 4.0     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+  muon_lr_multiplier: 66.7     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
   diffusion_chunk_blocks: 32  # spatial micro-batching
   teacher_bf16: true          # bf16 storage, fp32 accumulation
 

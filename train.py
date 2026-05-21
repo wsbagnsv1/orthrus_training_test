@@ -88,7 +88,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "precision": "bfloat16",
         "compile": True,
         "optimizer": "adamw",      # "adamw" or "muon"
-        "muon_lr_multiplier": 4.0,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "muon_lr_multiplier": 66.7,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
         "log_every": 1,
         "eval_every": 10,
         "acceptance_every": 20,
@@ -430,12 +430,12 @@ def train(config: Dict[str, Any]):
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
-    # Set initial LR on all optimizers
+    # LambdaLR needs initial_lr set on every param group when last_epoch >= 0
     for opt in optimizers:
         for pg in opt.param_groups:
-            pg['lr'] = peak_lr * _lr_fn(0)
-    # Scheduler uses the canonical optimizer
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn)
+            if 'initial_lr' not in pg:
+                pg['initial_lr'] = pg['lr']
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn, last_epoch=0)
 
     config["training"]["_total_steps"] = total_steps
     print(f"  Total steps: {total_steps} (warmup: {warmup_steps})")
@@ -469,12 +469,14 @@ def train(config: Dict[str, Any]):
                     schedule_step = warmup_steps + int((total_steps - warmup_steps) * progress)
                 print(f"  → LR schedule mapped: global_step={global_step} → schedule_step={schedule_step}")
         # Rebuild scheduler + LR on all optimizers
-        for opt in optimizers:
+        muon_mult = config["training"].get("muon_lr_multiplier", 4.0)
+        for i, opt in enumerate(optimizers):
+            lr = peak_lr * muon_mult if (optimizer_type == "muon" and i == 0) else peak_lr
             for pg in opt.param_groups:
-                pg['lr'] = peak_lr
-                pg['initial_lr'] = peak_lr
+                pg['lr'] = lr
+                pg['initial_lr'] = lr
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_fn, last_epoch=schedule_step)
-        current_lr = peak_lr * _lr_fn(schedule_step)
+        current_lr = peak_lr * muon_mult * _lr_fn(schedule_step) if optimizer_type == "muon" else peak_lr * _lr_fn(schedule_step)
         print(f"  Rebuilt scheduler: peak={peak_lr:.2e} "
               f"schedule_step={schedule_step} LR={current_lr:.2e}")
 
@@ -827,7 +829,8 @@ def load_checkpoint(model, optimizer, scheduler, ckpt_dir, optimizers=None):
         # Multiple optimizers saved as {0: state, 1: state}
         if optimizers is not None:
             for i, opt in enumerate(optimizers):
-                opt.load_state_dict(opt_state[str(i)])
+                # keys may be int or str depending on save version
+                opt.load_state_dict(opt_state.get(i) or opt_state.get(str(i)))
     else:
         optimizer.load_state_dict(opt_state)
     # scheduler rebuilt from config - don't load stale LR
