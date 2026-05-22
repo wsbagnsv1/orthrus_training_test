@@ -405,6 +405,7 @@ class OrthrusSmolLM2(nn.Module):
         causal_limit: Tensor | None = None,
         return_hidden: bool = False,
         diff_position_ids: Tensor | None = None,
+        use_flex: bool = True,
     ) -> Tensor:
         B = diff_input_ids.shape[0]
         K = self.block_size
@@ -428,26 +429,28 @@ class OrthrusSmolLM2(nn.Module):
                 diff_len, ar_seq_len, K, device
             ).expand(B, -1)
 
-        # Static block mask (pure shape — cached once, zero recompilations)
-        cache_key = (B, diff_len, ar_seq_len, K)
-        if not hasattr(self, '_mask_cache'):
-            self._mask_cache = {}
-        if cache_key not in self._mask_cache:
-            self._mask_cache[cache_key] = build_dual_pass_block_mask(
-                batch_size=B,
-                num_heads=self.config.num_attention_heads,
-                diffusion_length=diff_len,
-                ar_len=ar_seq_len,
-                block_size=K,
-                device=device,
-            )
-        flex_block_mask = self._mask_cache[cache_key]
+        # Static block mask (cached once, zero recompilations) — skip for plain SDPA
+        flex_block_mask = None
+        causal_score_mod = None
+        if use_flex:
+            cache_key = (B, diff_len, ar_seq_len, K)
+            if not hasattr(self, '_mask_cache'):
+                self._mask_cache = {}
+            if cache_key not in self._mask_cache:
+                self._mask_cache[cache_key] = build_dual_pass_block_mask(
+                    batch_size=B,
+                    num_heads=self.config.num_attention_heads,
+                    diffusion_length=diff_len,
+                    ar_len=ar_seq_len,
+                    block_size=K,
+                    device=device,
+                )
+            flex_block_mask = self._mask_cache[cache_key]
 
-        # Dynamic causal masking via score_mod (runs on SRAM scores, no recomp)
-        def causal_score_mod(score, b, h, q_idx, kv_idx):
-            is_ar = kv_idx < ar_seq_len
-            valid_ar = kv_idx <= causal_limit[b, q_idx]
-            return torch.where(is_ar & (~valid_ar), float('-inf'), score)
+            def causal_score_mod(score, b, h, q_idx, kv_idx):
+                is_ar = kv_idx < ar_seq_len
+                valid_ar = kv_idx <= causal_limit[b, q_idx]
+                return torch.where(is_ar & (~valid_ar), float('-inf'), score)
 
         layers = self.base_model.model.layers
         ckpt = self.checkpoint_every
@@ -505,6 +508,7 @@ class OrthrusSmolLM2(nn.Module):
         causal_limit: Tensor | None = None,
         return_hidden: bool = False,
         diff_position_ids: Tensor | None = None,
+        use_flex: bool = True,
     ) -> Tensor:
         if not is_diffusion_pass:
             _, hidden = self.forward_ar_prefill(input_ids, attention_mask)
@@ -517,6 +521,7 @@ class OrthrusSmolLM2(nn.Module):
                 causal_limit=causal_limit,
                 return_hidden=return_hidden,
                 diff_position_ids=diff_position_ids,
+                use_flex=use_flex,
             )
 
     # ------------------------------------------------------------------

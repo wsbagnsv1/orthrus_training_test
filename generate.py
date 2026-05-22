@@ -20,6 +20,9 @@ from typing import Optional, List, Tuple
 
 import torch
 import torch.nn.functional as F
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('highest')
 from torch import Tensor
 from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -35,15 +38,15 @@ from model import OrthrusSmolLM2
 # ── sampling helpers ─────────────────────────────────────────────────────────
 
 def sample_token(
-    logits: Tensor,                      # [1, vocab]
+    logits: Tensor,                      # [vocab], [L, vocab], or [B, L, vocab]
     temperature: float = 0.0,
     top_k: int = 0,
     top_p: float = 1.0,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """
-    Sample a single token from logits.
+    Sample token(s) from logits. Handles any batch shape.
 
-    Returns (token_id, probs).
+    Returns (token_ids, probs).
     probs is None for greedy (temperature=0).
     """
     if temperature < 1e-5:
@@ -52,14 +55,14 @@ def sample_token(
     # Scale by temperature
     scaled = logits / temperature
 
-    # Top-k
+    # Top-k (applied to last dim)
     if top_k > 0:
-        v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+        v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)), dim=-1)
         scaled[scaled < v[..., [-1]]] = -float("inf")
 
     # Top-p (nucleus)
     if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+        sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
         sorted_indices_to_remove = cumulative_probs > top_p
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
@@ -70,8 +73,9 @@ def sample_token(
         scaled[indices_to_remove] = -float("inf")
 
     probs = F.softmax(scaled, dim=-1)
-    token = torch.multinomial(probs, 1)
-    return token, probs
+    flat_probs = probs.view(-1, probs.size(-1))
+    tokens = torch.multinomial(flat_probs, 1).view(probs.shape[:-1])
+    return tokens, probs
 
 
 # ── main generation loop ────────────────────────────────────────────────────
@@ -89,7 +93,7 @@ def generate_orthrus(
     stream: bool = False,
 ) -> Tuple[str, dict]:
     """
-    Generate text using Orthrus consensus decoding.
+    Generate text using Orthrus consensus decoding (matches reference OrthrusLM.generate).
 
     Returns (generated_text, stats_dict).
     stats includes: tokens_generated, forward_passes, tpf, acceptance_lengths.
@@ -100,201 +104,166 @@ def generate_orthrus(
     mask_id = tokenizer.convert_tokens_to_ids("<mask>")
     eos_id = tokenizer.eos_token_id
 
+    # Deterministic: same seed for greedy decoding
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
     # ── Tokenize prompt ─────────────────────────────────────────────────────
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     prompt_len = input_ids.shape[1]
     max_len = prompt_len + max_new_tokens
 
-    # ── AR Prefill ──────────────────────────────────────────────────────────
-    ar_kv_cache, ar_logits = model.forward_ar_prefill(input_ids)
-    past_key_values = ar_kv_cache  # DynamicCache, we'll extend it
+    # Allocate output buffer
+    output_ids = torch.full((1, max_len + K), mask_id, dtype=torch.long, device=device)
+    output_ids[:, :prompt_len] = input_ids
 
-    # First token (from AR prefill)
-    next_token, _ = sample_token(ar_logits[:, -1, :], temperature, top_k, top_p)
+    # ── AR Prefill (shared KV cache) ────────────────────────────────────────
+    position_ids = torch.arange(prompt_len, device=device).unsqueeze(0)
+    base_out = model.base_model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+    past_key_values = base_out.past_key_values
+
+    # First token from prefill logits
+    first_logits = base_out.logits[:, -1, :]
+    next_token, _ = sample_token(first_logits, temperature, top_k, top_p)
     next_token_id = next_token.item()
 
-    generated_ids: List[int] = [next_token_id]
+    start_idx = prompt_len
+    output_ids[:, start_idx] = next_token_id
+
     if next_token_id == eos_id:
-        output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        output = tokenizer.decode([next_token_id], skip_special_tokens=True)
         return output, {
-            "tokens_generated": 1,
-            "forward_passes": 1,
-            "tpf": 1.0,
-            "acceptance_lengths": [1],
+            "tokens_generated": 1, "forward_passes": 1, "tpf": 1.0,
+            "acceptance_lengths": [], "avg_acceptance": 0.0,
         }
 
-    current_len = prompt_len
     total_forward_passes = 1  # prefill
-    total_tokens = 0
     all_acceptance_lengths: List[int] = []
 
     if verbose:
         print(f"[Prefill] {prompt_len} tokens, first token: {tokenizer.decode([next_token_id])!r}")
 
     # ── Generation loop ─────────────────────────────────────────────────────
-    while current_len < max_len - 1:
-        remaining = max_len - current_len
-        diff_len = min(K, remaining)
-        actual_block_size = diff_len
+    while start_idx < max_len - 1:
+        diff_len = min(K, max_len - start_idx)
 
-        # ── Step 1: Build diffusion block ───────────────────────────────────
-        anchor_token = generated_ids[-1]
-        diff_block_ids = torch.full(
-            (1, diff_len), mask_id, dtype=torch.long, device=device
-        )
-        diff_block_ids[:, 0] = anchor_token
+        # Build diffusion block: anchor at position 0, masks at 1..K-1
+        diff_block_ids = torch.full((1, diff_len), mask_id, dtype=torch.long, device=device)
+        diff_block_ids[:, 0] = output_ids[:, start_idx]
+        diff_position_ids = torch.arange(start_idx, start_idx + diff_len, device=device).unsqueeze(0)
 
-        diff_position_ids = torch.arange(
-            current_len, current_len + diff_len, device=device
-        ).unsqueeze(0)
-
-        # ── Step 2: Diffusion parallel projection ───────────────────────────
-        # Build causal_limit: anchor token sees up to current_len-1;
-        # mask positions k see up to current_len + k - 1
+        # Step 1: Diffusion parallel projection (no cache update)
         causal_limit = torch.zeros(1, diff_len, dtype=torch.long, device=device)
-        causal_limit[0, 0] = current_len - 1   # anchor sees AR up to itself
-        for k in range(1, diff_len):
-            causal_limit[0, k] = current_len + k - 1
+        for k in range(diff_len):
+            causal_limit[0, k] = start_idx - 1
 
-        # We need AR prefix length for the diffusion forward
-        # Build fresh DynamicCache with current past_key_values
-        diff_outputs = model(
+        diff_logits = model(
             input_ids=diff_block_ids,
             is_diffusion_pass=True,
             ar_past_key_values=past_key_values,
-            ar_seq_len=current_len,
+            ar_seq_len=start_idx,
             causal_limit=causal_limit,
-        )
-        # diff_outputs is logits: [1, diff_len, vocab]
-
+            use_flex=False,  # plain SDPA, no flex_attention overhead
+        )  # [1, diff_len, vocab]
         total_forward_passes += 1
 
-        # Sample from diffusion predictions (all positions except we reuse anchor)
+        # Sample from positions 0..K-2 → predictions for positions 1..K-1
         if diff_len > 1:
-            diff_tokens = []
-            diff_probs_list = []
-            for k in range(1, diff_len):  # skip anchor (position 0)
-                tok, prob = sample_token(
-                    diff_outputs[:, k, :], temperature, top_k, top_p
-                )
-                diff_tokens.append(tok.item())
-                diff_probs_list.append(prob)
-            # Prepend anchor
-            proposed_block_ids = [anchor_token] + diff_tokens
-            diff_probs = (
-                torch.cat(diff_probs_list, dim=0)
-                if diff_probs_list and diff_probs_list[0] is not None
-                else None
-            )
+            diff_tokens, diff_probs = sample_token(diff_logits[:, :-1, :], temperature, top_k, top_p)
         else:
-            proposed_block_ids = [anchor_token]
+            diff_tokens = torch.empty((1, 0), dtype=torch.long, device=device)
             diff_probs = None
 
-        proposed_block = torch.tensor(
-            [proposed_block_ids], dtype=torch.long, device=device
-        )
+        proposed_block = torch.cat([output_ids[:, start_idx:start_idx+1], diff_tokens], dim=1)
 
-        # ── Step 3: AR verification ─────────────────────────────────────────
-        ar_position_ids = torch.arange(
-            current_len, current_len + len(proposed_block_ids), device=device
-        ).unsqueeze(0)
-
+        # Step 2: AR verification — batch pass for consensus only
         ar_outputs = model.base_model(
             input_ids=proposed_block,
-            position_ids=ar_position_ids,
+            position_ids=diff_position_ids,
             past_key_values=past_key_values,
             use_cache=True,
         )
-        ar_logits = ar_outputs.logits  # [1, block_len, vocab]
-        updated_cache = ar_outputs.past_key_values
-
+        ar_logits = ar_outputs.logits  # [1, K, vocab]
+        ar_tokens, ar_probs = sample_token(ar_logits, temperature, top_k, top_p)
         total_forward_passes += 1
 
-        # ── Step 4: Consensus verification ──────────────────────────────────
-        # AR logit at position k predicts token at k+1.
-        # So ar_logits[0, k] should match proposed_block_ids[k+1] for k=0..K-2.
-        # The anchor token (proposed_block_ids[0]) is always accepted (identity).
-        accepted: List[int] = [proposed_block_ids[0]]  # anchor always accepted
-        block_len = ar_logits.shape[1]
-
-        for k in range(1, block_len):  # k = 1..K-1, the mask positions
-            proposed_tok = proposed_block_ids[k]
-            ar_pred_logit = ar_logits[0, k - 1]  # predicts token at position k
-
+        # Step 3: Consensus
+        # ar_tokens[0, k] and diff_tokens[0, k] both predict position start_idx + k + 1
+        if diff_tokens.shape[1] > 0:
             if temperature < 1e-5:
-                # Greedy: exact match required
-                ar_pred = ar_pred_logit.argmax().item()
-                if proposed_tok == ar_pred:
-                    accepted.append(proposed_tok)
-                else:
-                    accepted.append(ar_pred)
-                    break
+                matches = (diff_tokens == ar_tokens[:, :-1])
+                acceptance_len = int(matches.cumprod(dim=1).sum(dim=1)[0].item())
+                next_token_corrected = ar_tokens[:, acceptance_len:acceptance_len+1]
             else:
-                # Rejection sampling (Leviathan et al. 2022)
-                p_ar = F.softmax(ar_pred_logit / temperature, dim=-1)
-
-                if diff_probs is None:
-                    accepted.append(proposed_tok)
-                    continue
-
-                # diff_probs[k-1] is the diffusion distribution for position k
-                p_diff = diff_probs[k - 1]
-                p_ar_tok = p_ar[proposed_tok].item()
-                p_diff_tok = p_diff[0, proposed_tok].item()
-
-                accept_prob = min(1.0, p_ar_tok / max(p_diff_tok, 1e-8))
-                if torch.rand(1, device=device).item() < accept_prob:
-                    accepted.append(proposed_tok)
-                else:
-                    # Sample correction from residual distribution
-                    residual = (p_ar - p_diff[0]).clamp(min=0)
-                    residual_sum = residual.sum()
-                    if residual_sum > 1e-8:
-                        correction = torch.multinomial(
-                            residual / residual_sum, 1
-                        ).item()
+                acceptance_len = 0
+                for i in range(diff_tokens.shape[1]):
+                    q_prob = diff_probs[0, i, diff_tokens[0, i]] if diff_probs is not None else 1.0
+                    p_prob = ar_probs[0, i, diff_tokens[0, i]] if ar_probs is not None else 1.0
+                    if torch.rand(1, device=device).item() < min(1.0, (p_prob / max(q_prob, 1e-8)).item()):
+                        acceptance_len += 1
                     else:
-                        correction = torch.multinomial(p_ar, 1).item()
-                    accepted.append(correction)
+                        break
+                if acceptance_len < diff_tokens.shape[1]:
+                    p_dist = ar_probs[0, acceptance_len]
+                    residual = torch.clamp(p_dist - diff_probs[0, acceptance_len], min=0.0)
+                    residual_sum = residual.sum()
+                    next_token_corrected = torch.multinomial(
+                        residual / residual_sum if residual_sum > 1e-5 else p_dist, 1
+                    ).unsqueeze(0)
+                else:
+                    next_token_corrected = ar_tokens[:, acceptance_len:acceptance_len+1]
+        else:
+            acceptance_len = 0
+            next_token_corrected = ar_tokens[:, :1]
+
+        all_acceptance_lengths.append(acceptance_len + 1)
+
+        # Step 4: Commit accepted tokens (float32 AR = bit-exact, no replay)
+        end_idx = start_idx + acceptance_len + 1
+        accepted_block = proposed_block[:, :acceptance_len + 1]
+        output_ids[:, start_idx:end_idx] = accepted_block
+        past_key_values.crop(end_idx)
+
+        # Check EOS in accepted block
+        eos_in_block = (accepted_block[:, 1:] == eos_id).any()
+        if eos_in_block:
+            for i in range(1, acceptance_len + 1):
+                if int(accepted_block[0, i].item()) == eos_id:
+                    start_idx = start_idx + i + 1
                     break
-
-            # Check for EOS
-            if accepted[-1] == eos_id:
-                break
-
-        acceptance_len = len(accepted)
-        all_acceptance_lengths.append(acceptance_len)
-
-        if verbose:
-            accepted_text = tokenizer.decode(accepted, skip_special_tokens=True)
-            print(f"  [Block] accepted {acceptance_len}/{block_len}: {accepted_text!r}")
-
-        # ── Step 5: Commit accepted tokens, update cache ────────────────────
-        generated_ids.extend(accepted)
-        current_len += acceptance_len
-
-        # Truncate cache to current length
-        past_key_values = updated_cache
-        past_key_values.crop(current_len)
-
-        total_tokens += acceptance_len
-
-        # Check for EOS
-        if eos_id in accepted:
             break
 
+        start_idx = end_idx
+
+        next_tok_id = int(next_token_corrected[0, 0].item())
+        if start_idx < max_len:
+            output_ids[:, start_idx] = next_token_corrected
+            if next_tok_id == eos_id:
+                break
+
+        if verbose:
+            accepted_text = tokenizer.decode(
+                accepted_block[0, 1:acceptance_len+1].tolist(), skip_special_tokens=True
+            )
+            print(f"  [Block] accepted {acceptance_len + 1}/{proposed_block.shape[1]}: {accepted_text!r}")
+
     # ── Decode ──────────────────────────────────────────────────────────────
+    generated_ids = output_ids[0, prompt_len:start_idx + 1].tolist()
+    generated_ids = [t for t in generated_ids if t != mask_id]
     output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
     stats = {
-        "tokens_generated": total_tokens,
+        "tokens_generated": len(generated_ids),
         "forward_passes": total_forward_passes,
-        "tpf": total_tokens / max(total_forward_passes, 1),
+        "tpf": len(generated_ids) / max(total_forward_passes, 1),
         "acceptance_lengths": all_acceptance_lengths,
         "avg_acceptance": (
             sum(all_acceptance_lengths) / len(all_acceptance_lengths)
             if all_acceptance_lengths
             else 0.0
         ),
+        "max_acceptance": max(all_acceptance_lengths) if all_acceptance_lengths else 0,
     }
 
     if verbose:
@@ -309,7 +278,8 @@ def generate_orthrus(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Orthrus SmolLM2 generation")
-    parser.add_argument("--checkpoint", type=str, required=True,
+    parser.add_argument("--checkpoint", type=str,
+                        default="../checkpoints/step_6000/diffusion_heads.pt",
                         help="Path to diffusion_heads.pt checkpoint")
     parser.add_argument("--base_model", type=str,
                         default="HuggingFaceTB/SmolLM2-135M-Instruct")
@@ -322,6 +292,11 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    # Resolve checkpoint path relative to this script
+    ckpt_path = args.checkpoint
+    if not os.path.isabs(ckpt_path):
+        ckpt_path = os.path.join(os.path.dirname(__file__), ckpt_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -343,12 +318,15 @@ if __name__ == "__main__":
     model.base_model.resize_token_embeddings(len(tokenizer))
 
     # Load trained diffusion heads
-    print(f"Loading diffusion heads from {args.checkpoint}...")
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    print(f"Loading diffusion heads from {ckpt_path}...")
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=False)
 
     model = model.to(device=device)
     model.eval()
+
+    model.base_model = model.base_model.to(dtype=torch.float32)
+    model.diffusion_heads = model.diffusion_heads.to(dtype=torch.float32)
 
     # Generate
     print(f"\nPrompt: {args.prompt}")
