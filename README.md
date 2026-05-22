@@ -11,3 +11,5 @@ https://github.com/chiennv2000/orthrus
 
 
 (triton kernels are currently NOT better than flex attention but might be interesting for future optimization.
+
+Im currently working on an optimized version that should work better generally
