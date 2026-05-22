@@ -11,4 +11,4 @@ Thanks to the guys behind orthrus for their paper [Memory-Efficient Parallel Tok
 Their github repo: 
 https://github.com/chiennv2000/orthrus
 
-(triton kernels are currently NOT better than flex attention but might be interesting for future optimization.
+(triton kernels are currently NOT better than flex attention and currently not working but might be interesting for future optimization.
