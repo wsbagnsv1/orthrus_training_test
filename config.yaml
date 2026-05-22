@@ -12,16 +12,16 @@ training:
   epochs: 2
   peak_lr: 2.0e-4
   lr_scheduler: "cosine"
-  warmup_ratio: 0.01
+  warmup_ratio: 0.05
   gradient_clip: 1.0
   micro_batch_size: 4
   gradient_accumulation_steps: 8  # effective batch = 32
   precision: "bfloat16"
   compile: true
   optimizer: "adamw"          # "adamw" or "muon"
-  muon_lr_multiplier: 66.67     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
-  weight_decay: 0.01         # AdamW weight decay (norms under Muon)
-  muon_weight_decay: 0.01    # Muon weight decay (paper recommends 0.01–0.1)
+  muon_lr_multiplier: 66.7     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+  weight_decay: 0.0         # AdamW weight decay (norms under Muon)
+  muon_weight_decay: 0.0    # Muon weight decay (paper recommends 0.01–0.1)
   diffusion_chunk_blocks: 32  # spatial micro-batching
   teacher_bf16: true          # bf16 storage, fp32 accumulation
 
