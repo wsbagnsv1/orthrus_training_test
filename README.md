@@ -12,3 +12,5 @@ Their github repo:
 https://github.com/chiennv2000/orthrus
 
 (triton kernels are currently NOT better than flex attention and currently not working but might be interesting for future optimization.
+
+I have added qwen3.5 training into a seperate branch, that one is full of trash and not optimized I intend to clean it up later, since i used gemini to cook up some custom kernels and that was creating a whole lot of test files, but in the end it seems to work decently. The trainig itself is better than pure pytorch training with those kernels but they are far from perfect. Im realtively sure the math behind it works but im not perfect so if you find errors please let me know. 
