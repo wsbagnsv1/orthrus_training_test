@@ -21,6 +21,7 @@ def load_orthrus_dataset(
     filter_fn: Optional[Callable] = None,
     seed: int = 42,
     streaming: bool = False,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
     **load_kwargs,
 ) -> Dataset:
     """
@@ -62,7 +63,17 @@ def load_orthrus_dataset(
 
     # If the dataset has 'messages' field (chat format), format into text
     if text_key == "messages":
-        ds = ds.map(_format_chat, remove_columns=ds.column_names)
+        if tokenizer is not None and hasattr(tokenizer, 'apply_chat_template'):
+            # Use the tokenizer's official chat template for exact match with inference
+            def _format_with_tokenizer(example: dict) -> dict:
+                messages = example.get("messages", [])
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False,
+                )
+                return {"text": text}
+            ds = ds.map(_format_with_tokenizer, remove_columns=ds.column_names)
+        else:
+            ds = ds.map(_format_chat, remove_columns=ds.column_names)
         text_key = "text"
 
     # Apply filter

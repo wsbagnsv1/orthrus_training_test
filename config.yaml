@@ -2,7 +2,7 @@
 # Based on the Orthrus paper (arXiv:2605.12825, Table 4)
 
 model:
-  base_model: "HuggingFaceTB/SmolLM2-135M-Instruct"
+  base_model: "F:/Users/timbe/Desktop/Orthrus/Qwen3.5-0.8B"
   K: 32                     # Parallel block size
   dtype: "bfloat16"
 
@@ -17,12 +17,13 @@ training:
   micro_batch_size: 4
   gradient_accumulation_steps: 8  # effective batch = 32
   precision: "bfloat16"
-  compile: true
-  optimizer: "adamw"          # "adamw" or "muon"
+  compile: false
+  optimizer: "muon"          # "adamw" or "muon"
   muon_lr_multiplier: 66.7     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
   weight_decay: 0.0         # AdamW weight decay (norms under Muon)
   muon_weight_decay: 0.0    # Muon weight decay (paper recommends 0.01–0.1)
-  diffusion_chunk_blocks: 32  # spatial micro-batching
+  diffusion_chunk_blocks: 16  # spatial micro-batching
+  eval_batch_size: 1            # smaller to avoid OOM during eval
   teacher_bf16: true          # bf16 storage, fp32 accumulation
 
   # Logging & checkpointing

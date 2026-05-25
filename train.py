@@ -1,9 +1,12 @@
 """
-Training script for Orthrus on SmolLM2-135M.
+Training script for Orthrus on Qwen3.5-0.8B.
 
 Aligns the diffusion head predictions with the frozen AR teacher via
 forward KL divergence (soft distillation), following the Orthrus paper
 (arXiv:2605.12825, Table 5 shows KL > CE for acceptance rate).
+
+Adapted from orthrus_smollm2/train.py for Qwen3.5's mixed
+(full_attention + linear_attention) architecture.
 
 Usage:
     python train.py                          # uses config.yaml defaults
@@ -20,6 +23,10 @@ import math
 import logging
 import yaml
 from pathlib import Path
+import torch
+
+# Force Tensor Cores to accumulate in FP32 instead of BF16 to prevent gradient explosions in massive MLPs
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 from typing import Dict, Any, Optional
 
 # ── suppress torch/distributed noise BEFORE any torch imports ───────────────
@@ -64,14 +71,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ── local imports ────────────────────────────────────────────────────────────
-from model import OrthrusSmolLM2
+from model import OrthrusQwen35Model
 from collator import OrthrusCollator
 from dataset import load_orthrus_dataset, load_multi_dataset, pretokenize_dataset
+from triton_kl_loss import triton_compute_kl_loss
 
 # ── defaults (mirror paper Table 4) ──────────────────────────────────────────
 DEFAULT_CONFIG: Dict[str, Any] = {
     "model": {
-        "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "base_model": "F:/Users/timbe/Desktop/Orthrus/Qwen3.5-0.8B",
         "K": 32,
         "dtype": "bfloat16",
     },
@@ -141,17 +149,20 @@ def _get_kl_indices(B: int, B_blocks: int, K: int, device: torch.device):
 
 def compute_kl_loss(
     diff_hidden: torch.Tensor,          # [B, B_blocks*K, D]
-    ar_hidden_states: torch.Tensor,    # [B, L, D]
+    ar_hidden_states: torch.Tensor,     # [B, L, D]
     lm_head: nn.Module,
-    anchor_positions: torch.Tensor,    # [B, B_blocks]
+    anchor_positions: torch.Tensor,     # [B, B_blocks]
     K: int,
-    target_ids: torch.Tensor,          # [B, B_blocks*K]
+    target_ids: torch.Tensor,           # [B, B_blocks*K]
     pad_token_id: int,
-    teacher_probs: torch.Tensor | None = None,       # [B, L, vocab] precomputed softmax(lm_head(ar))
-    teacher_ent: torch.Tensor | None = None,         # [B, L] precomputed entropy
+    forward_only: bool = False,
 ) -> torch.Tensor:
-    """Chunked KL divergence. When teacher_probs/teacher_ent are provided,
-    skips lm_head(ar_hidden) - saves ~50% of lm_head calls."""
+    """
+    Computes KL distillation using a custom Fused Triton Kernel.
+    Valid tokens are filtered first to avoid calculating logits for padding.
+
+    forward_only: use loss-only Triton path (eval); no grad buffers.
+    """
     B, B_blocks = anchor_positions.shape
     device = diff_hidden.device
     L = ar_hidden_states.shape[1]
@@ -164,50 +175,27 @@ def compute_kl_loss(
     valid = (tgt != pad_token_id)
     total_tokens = valid.sum().float()
     if total_tokens == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=not forward_only)
 
-    use_precomputed = teacher_probs is not None and teacher_ent is not None
-    CHUNK = 2048  # bf16 = half memory, can double chunk size
-    total_kl = 0.0
+    s_chunk = diff_hidden[batch_idx, diff_pos]
+    t_chunk = ar_hidden_states[batch_idx, ar_pos]
 
-    for c in range(0, N, CHUNK):
-        c_end = min(c + CHUNK, N)
-        chunk_valid = valid[:, c:c_end].float()
-        if not chunk_valid.any():
-            continue
+    valid_flat = valid.reshape(-1)
+    s_chunk_flat = s_chunk.reshape(-1, s_chunk.size(-1))
+    t_chunk_flat = t_chunk.reshape(-1, t_chunk.size(-1))
 
-        b_idx = batch_idx[:, c:c_end]
-        d_idx = diff_pos[:, c:c_end]
-        a_idx = ar_pos[:, c:c_end]
+    s_valid = s_chunk_flat[valid_flat]
+    t_valid = t_chunk_flat[valid_flat]
 
-        with torch.no_grad():
-            if use_precomputed:
-                p_t_chunk = teacher_probs[b_idx, a_idx]
-                ent_chunk = teacher_ent[b_idx, a_idx]
-            else:
-                ar_hidden_chunk = ar_hidden_states[b_idx, a_idx]
-                teacher_logits = lm_head(ar_hidden_chunk).float()
-                p_t_chunk = F.softmax(teacher_logits, dim=-1)
-                ent_chunk = -(p_t_chunk * F.log_softmax(teacher_logits, dim=-1)).sum(dim=-1)
+    if s_valid.size(0) > 0:
+        if forward_only:
+            from triton_kl_loss import triton_compute_kl_loss_fwd_only
+            kl_mean = triton_compute_kl_loss_fwd_only(s_valid, t_valid, lm_head.weight)
+        else:
+            kl_mean = triton_compute_kl_loss(s_valid, t_valid, lm_head.weight)
+        return kl_mean * (s_valid.size(0) / total_tokens)
 
-        total_kl += _kl_chunk_body(diff_hidden, b_idx, d_idx, p_t_chunk, ent_chunk, chunk_valid, lm_head, B)
-
-    return total_kl / total_tokens
-
-
-@torch.compile(mode="default", fullgraph=False, dynamic=True)
-def _kl_chunk_body(diff_hidden, b_idx, d_idx, p_t_chunk, ent_chunk, chunk_valid, lm_head, B):
-    """Compiled inner body: gather → lm_head → cross_entropy → weighted sum."""
-    d_hidden_chunk = diff_hidden[b_idx, d_idx]
-    d_logits_chunk = lm_head(d_hidden_chunk)
-    # bf16 cross_entropy (fast Tensor core) → fp32 for KL accumulation (accurate gradients)
-    chunk_ce = F.cross_entropy(
-        d_logits_chunk.view(-1, d_logits_chunk.size(-1)),
-        p_t_chunk.view(-1, p_t_chunk.size(-1)),
-        reduction='none',
-    ).view(B, -1)
-    chunk_kl = chunk_ce.float() - ent_chunk.float()
-    return (chunk_kl * chunk_valid.float()).sum()
+    return torch.tensor(0.0, device=device, requires_grad=not forward_only)
 
 
 # ── JSONL metrics logger (async via background thread) ──────────────────────
@@ -284,18 +272,16 @@ def train(config: Dict[str, Any]):
     print(f"  vocab size = {len(tokenizer)}")
 
     # ── model ────────────────────────────────────────────────────────────────
-    print("Loading OrthrusSmolLM2 model...")
-    model = OrthrusSmolLM2(
-        base_model_name=config["model"]["base_model"],
+    print("Loading OrthrusQwen35Model...")
+    model = OrthrusQwen35Model(
+        base_model_path=config["model"]["base_model"],
         block_size=config["model"]["K"],
         dtype=dtype,
     )
     # Resize embeddings if tokenizer was extended
-    model.base_model.resize_token_embeddings(len(tokenizer))
-
     model = model.to(device=device, dtype=dtype)
     print(f"  Trainable params: {model.trainable_params:,}")
-    print(f"  Base model frozen: {all(not p.requires_grad for p in model.base_model.parameters())}")
+    print(f"  Frozen backbone: {all(not p.requires_grad for p in model.base_model.parameters())}")
 
     # ── dataset ──────────────────────────────────────────────────────────────
     print("Loading dataset...")
@@ -313,6 +299,7 @@ def train(config: Dict[str, Any]):
             config_name=dataset_config_name,
             max_samples=data_cfg.get("max_samples"),
             text_key=data_cfg.get("text_key", "text"),
+            tokenizer=tokenizer,
         )
         # Load a separate validation split (use 'test' split for smoltalk)
         val_split = data_cfg.get("eval_split", "test")
@@ -323,6 +310,7 @@ def train(config: Dict[str, Any]):
                 split=val_split,
                 max_samples=data_cfg.get("max_eval_samples", 2000),
                 text_key=text_key,
+                tokenizer=tokenizer,
             )
             print(f"  Validation split: '{val_split}' → {len(val_ds)} examples")
         except Exception:
@@ -369,7 +357,7 @@ def train(config: Dict[str, Any]):
         )
         val_dataloader = DataLoader(
             val_ds,
-            batch_size=config["training"]["micro_batch_size"],
+            batch_size=config["training"].get("eval_batch_size", 1),
             shuffle=False,
             collate_fn=val_collator,
             num_workers=0,
@@ -490,7 +478,7 @@ def train(config: Dict[str, Any]):
 
     # ── training loop ────────────────────────────────────────────────────────
     use_scaler = (dtype == torch.float16)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)  # fp16 needs scaling, bf16 doesn't
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)  # fp16 needs scaling, bf16 doesn't
     accum_loss = 0.0
     _profile_step = global_step + 3  # print detailed breakdown 3 steps after resume/ start
 
@@ -537,52 +525,30 @@ def train(config: Dict[str, Any]):
                 ar_input_ids = ar_input_ids[:, :ar_seq_len]
                 ar_attention_mask = ar_attention_mask[:, :ar_seq_len]
 
-                # Step 1: AR prefill (frozen, no grad) - run ONCE per batch
+                # Step 1: Single-pass AR prefill + fused Triton state extraction
                 _profile = (global_step == _profile_step - 1)
                 _t0 = time.perf_counter() if _profile else 0
                 with torch.no_grad():
-                    ar_kv_cache, ar_hidden = model.forward_ar_prefill(
-                        ar_input_ids, ar_attention_mask
+                    ar_kv_cache, ar_hidden, linear_states, per_block_la_conv = model.forward_ar_prefill(
+                        ar_input_ids, ar_attention_mask, anchor_positions=anchor_positions,
                     )
+                    per_block_fa_kv = {}
                 if _profile: torch.cuda.synchronize(); _t_ar = (time.perf_counter() - _t0) * 1000
 
-                # Precompute teacher probs once per batch (chunked by L to save VRAM)
-                with torch.no_grad():
-                    CHUNK_L = 512
-                    tp_list, te_list = [], []
-                    for s in range(0, ar_seq_len, CHUNK_L):
-                        e = min(s + CHUNK_L, ar_seq_len)
-                        ar_logits = model.lm_head(ar_hidden[:, s:e]).float()
-                        log_p = F.log_softmax(ar_logits, dim=-1)
-                        p = torch.exp(log_p)
-                        te_chunk = -(p * log_p).sum(dim=-1)
-                        if config["training"].get("teacher_bf16", False):
-                            tp_list.append(p.to(torch.bfloat16))
-                            te_list.append(te_chunk.to(torch.bfloat16))
-                        else:
-                            tp_list.append(p)
-                            te_list.append(te_chunk)
-                        del ar_logits, log_p, p
-                    teacher_probs = torch.cat(tp_list, dim=1)
-                    teacher_ent = torch.cat(te_list, dim=1)
-
-                # Precompute per-token valid mask so token-count weighting is
-                # invariant to chunk size (avoids KL drift from uneven padding)
+                # Precompute per-token valid mask
                 _diff_pos, _batch_idx, _ = _get_kl_indices(B, B_blocks_total, K, target_ids.device)
                 total_valid_mask = (
                     target_ids[_batch_idx, _diff_pos] != pad_token_id
-                )  # [B, B_blocks_total * (K-1)]
+                )
                 total_valid_tokens = total_valid_mask.sum().float()
 
-                # Step 2+3: Diffusion micro-batching - each chunk of blocks
-                # runs forward + backward independently, freeing activations
+                # Step 2: Diffusion micro-batching — each chunk uses its per-block states
                 batch_loss = 0.0
                 _t_fwd = _t_kl = _t_bwd = 0.0
                 for blk_start in range(0, B_blocks_total, diff_chunk_blocks):
                     blk_end = min(blk_start + diff_chunk_blocks, B_blocks_total)
                     n_blocks = blk_end - blk_start
-
-                    # Token-count weight for this chunk (invariant to chunk size)
+                    block_indices = torch.arange(blk_start, blk_end, device=device)
                     n_start = blk_start * (K - 1)
                     n_end = blk_end * (K - 1)
                     chunk_valid_tokens = total_valid_mask[:, n_start:n_end].sum().float()
@@ -607,6 +573,10 @@ def train(config: Dict[str, Any]):
                         causal_limit=chunk_causal,
                         return_hidden=True,
                         diff_position_ids=chunk_positions,
+                        linear_states=linear_states,
+                        block_indices=block_indices,
+                        per_block_fa_kv=per_block_fa_kv,
+                        per_block_la_conv=per_block_la_conv,
                     )
                     if _profile: torch.cuda.synchronize(); _t_fwd += (time.perf_counter() - _tf0) * 1000
 
@@ -618,9 +588,7 @@ def train(config: Dict[str, Any]):
                         anchor_positions=chunk_anchor,
                         K=K,
                         target_ids=chunk_target,
-                        pad_token_id=pad_token_id,
-                        teacher_probs=teacher_probs,
-                        teacher_ent=teacher_ent,
+                        pad_token_id=pad_token_id
                     )
                     if _profile: torch.cuda.synchronize(); _t_kl += (time.perf_counter() - _tk0) * 1000
 
@@ -639,11 +607,13 @@ def train(config: Dict[str, Any]):
                         scaled_loss.backward()
                     if _profile: torch.cuda.synchronize(); _t_bwd += (time.perf_counter() - _tb0) * 1000
                     batch_loss += chunk_loss.item() * weight
+                    # Free diffusion activations immediately to prevent memory leak
+                    del diff_hidden, chunk_loss, scaled_loss
 
                 accum_loss += batch_loss
 
                 # Free AR intermediates
-                del ar_hidden, ar_kv_cache
+                del ar_hidden, ar_kv_cache, linear_states, per_block_la_conv
 
                 if (batch_idx + 1) % config["training"]["gradient_accumulation_steps"] == 0:
                     if use_scaler:
@@ -723,6 +693,7 @@ def train(config: Dict[str, Any]):
                     # ── eval ───────────────────────────────────────────────────
                     if global_step % config["training"]["eval_every"] == 0:
                         eval_dl = val_dataloader if val_dataloader is not None else dataloader
+                        torch.cuda.empty_cache()
                         eval_loss = evaluate(
                             model, eval_dl, pad_token_id, device, dtype,
                             max_eval_batches=10,
@@ -758,7 +729,8 @@ def train(config: Dict[str, Any]):
                             f"rate: {acc_stats['acceptance_rate']:.2%} | "
                             f"avg_len: {acc_stats['avg_acceptance_len']:.1f}/{K} | "
                             f"TPF: {acc_stats['tpf']:.1f}× | "
-                            f"blocks: {acc_stats['num_blocks']}{off_str} <<<"
+                            f"blocks: {acc_stats['num_blocks']} | "
+                            f"gen_toks: {acc_stats.get('total_tokens_gen', 0)}{off_str} <<<"
                         )
                         log_metrics(global_step, None, accept_rate=acc_stats['acceptance_rate'])
 
@@ -861,21 +833,10 @@ def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10
         ar_input_ids = ar_input_ids[:, :ar_seq_len]
         ar_attention_mask = ar_attention_mask[:, :ar_seq_len]
 
-        ar_kv_cache, ar_hidden = model.forward_ar_prefill(ar_input_ids, ar_attention_mask)
-
-        # Precompute teacher probs (chunked by L to save VRAM)
-        CHUNK_L = 512; tp_list, te_list = [], []
-        for s in range(0, ar_seq_len, CHUNK_L):
-            e = min(s + CHUNK_L, ar_seq_len)
-            ar_logits = model.lm_head(ar_hidden[:, s:e]).float()
-            log_p = F.log_softmax(ar_logits, dim=-1)
-            p = torch.exp(log_p)
-            te_chunk = -(p * log_p).sum(dim=-1)
-            tp_list.append(p.to(torch.bfloat16) if config["training"].get("teacher_bf16", False) else p)
-            te_list.append(te_chunk.to(torch.bfloat16) if config["training"].get("teacher_bf16", False) else te_chunk)
-            del ar_logits, log_p, p
-        teacher_probs = torch.cat(tp_list, dim=1)
-        teacher_ent = torch.cat(te_list, dim=1)
+        # Single-pass AR prefill + fused Triton state extraction
+        ar_kv_cache, ar_hidden, linear_states, per_block_la_conv = model.forward_ar_prefill(
+            ar_input_ids, ar_attention_mask, anchor_positions=anchor_positions,
+        )
 
         K = model.block_size
         diff_chunk_blocks_inner = diff_chunk_blocks
@@ -896,17 +857,23 @@ def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10
                 causal_limit=causal_limit[:, tok_start:tok_end],
                 return_hidden=True,
                 diff_position_ids=chunk_positions,
+                linear_states=linear_states,
+                block_indices=torch.arange(blk_start, blk_end, device=device),
+                per_block_la_conv=per_block_la_conv,
             )
-            chunk_loss = compute_kl_loss(diff_hidden, ar_hidden, model.lm_head,
-                                          anchor_positions[:, blk_start:blk_end], K,
-                                          target_ids[:, tok_start:tok_end], pad_token_id,
-                                          teacher_probs=teacher_probs,
-                                          teacher_ent=teacher_ent)
+            chunk_loss = compute_kl_loss(
+                diff_hidden, ar_hidden, model.lm_head,
+                anchor_positions[:, blk_start:blk_end], K,
+                target_ids[:, tok_start:tok_end], pad_token_id,
+                forward_only=True,
+            )
             chunk_losses.append(chunk_loss.item() * n_blocks)
             del diff_hidden
 
         total_loss += sum(chunk_losses) / B_blocks_total
         total_tokens += 1
+        del ar_kv_cache, ar_hidden, linear_states, per_block_la_conv
+        torch.cuda.empty_cache()
     model.train()
     return total_loss / max(total_tokens, 1)
 
@@ -914,7 +881,7 @@ def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10
 @torch.no_grad()
 def evaluate_acceptance_rate(
     model, tokenizer, val_dataloader, device, dtype,
-    max_examples=8, max_tokens_per_example=64,
+    max_examples=4, max_tokens_per_example=128,
 ):
     """
     Run consensus generation on held-out examples and measure acceptance rate.
@@ -933,36 +900,180 @@ def evaluate_acceptance_rate(
     total_passes = 0
     examples_processed = 0
 
-    for batch in val_dataloader:
-        if examples_processed >= max_examples:
-            break
-        input_ids = batch["ar_input_ids"].to(device)
-        attention_mask = batch["ar_attention_mask"].to(device)
-        B = input_ids.shape[0]
+    # Assistant prompt tokens to find the start of generation
+    assistant_tokens = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
 
-        for i in range(B):
+    # ── Wrap Gated Delta Net to extract intermediate states ────────────
+    import transformers.models.qwen3_5.modeling_qwen3_5 as _q35m
+    from inference_kernel import fused_recurrent_inference_fwd
+    import torch.nn.functional as F
+
+    linear_layer_indices = [
+        i for i, lt in enumerate(model.config.layer_types)
+        if lt == "linear_attention"
+    ]
+    
+    saved_forwards = {}
+    for i in linear_layer_indices:
+        layer = model.base_model.model.layers[i]
+        gdn = layer.linear_attn
+        if 'forward' in gdn.__dict__:
+            saved_forwards[i] = gdn.__dict__['forward']
+        else:
+            saved_forwards[i] = None
+
+        def make_inference_wrapper(li, gdn_ref, ks_ref):
+            def wrapper(hidden_states, cache_params=None, attention_mask=None):
+                hidden_states = _q35m.apply_mask_to_padding_states(hidden_states, attention_mask)
+                batch_size, slen, _ = hidden_states.shape
+                use_precomputed_states = cache_params is not None and cache_params.has_previous_state(li)
+                if use_precomputed_states:
+                    conv_state = cache_params.layers[li].conv_states
+                    recurrent_state = cache_params.layers[li].recurrent_states
+
+                mixed_qkv = gdn_ref.in_proj_qkv(hidden_states)
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+
+                z = gdn_ref.in_proj_z(hidden_states)
+                z = z.reshape(batch_size, slen, -1, gdn_ref.head_v_dim)
+                b = gdn_ref.in_proj_b(hidden_states)
+                a = gdn_ref.in_proj_a(hidden_states)
+
+                if use_precomputed_states and slen == 1:
+                    mixed_qkv, new_conv_state = gdn_ref.causal_conv1d_update(
+                        x=mixed_qkv, conv_state=conv_state,
+                        weight=gdn_ref.conv1d.weight.squeeze(1),
+                        bias=gdn_ref.conv1d.bias, activation=gdn_ref.activation,
+                    )
+                    cache_params.update_conv_state(new_conv_state, li)
+                else:
+                    if use_precomputed_states:
+                        mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
+
+                    if cache_params is not None:
+                        cache_params.layers[li].pre_conv_mixed_qkv = mixed_qkv.clone()
+                        new_conv_state = F.pad(mixed_qkv, (ks_ref - mixed_qkv.shape[-1], 0))
+                        cache_params.update_conv_state(new_conv_state, li)
+                    
+                    if gdn_ref.causal_conv1d_fn is not None:
+                        mixed_qkv = gdn_ref.causal_conv1d_fn(
+                            x=mixed_qkv, weight=gdn_ref.conv1d.weight.squeeze(1),
+                            bias=gdn_ref.conv1d.bias, activation=gdn_ref.activation, seq_idx=None,
+                        )
+                    else:
+                        mixed_qkv = F.silu(gdn_ref.conv1d(mixed_qkv)[:, :, :mixed_qkv.shape[-1]])
+                    if use_precomputed_states:
+                        mixed_qkv = mixed_qkv[:, :, -slen:]
+
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+                qkv_splits = [gdn_ref.key_dim, gdn_ref.key_dim, gdn_ref.value_dim]
+                query, key, value = torch.split(mixed_qkv, qkv_splits, dim=-1)
+                query = query.reshape(batch_size, slen, -1, gdn_ref.head_k_dim)
+                key = key.reshape(batch_size, slen, -1, gdn_ref.head_k_dim)
+                value = value.reshape(batch_size, slen, -1, gdn_ref.head_v_dim)
+
+                beta = b.sigmoid()
+                g = -gdn_ref.A_log.float().exp() * F.softplus(a.float() + gdn_ref.dt_bias)
+                if gdn_ref.num_v_heads // gdn_ref.num_k_heads > 1:
+                    query = query.repeat_interleave(gdn_ref.num_v_heads // gdn_ref.num_k_heads, dim=2)
+                    key = key.repeat_interleave(gdn_ref.num_v_heads // gdn_ref.num_k_heads, dim=2)
+
+                if slen > 128:
+                    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
+                    o, last_recurrent_state = chunk_gated_delta_rule(
+                        query, key, value, g=g, beta=beta,
+                        initial_state=recurrent_state if use_precomputed_states else None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    h_out = None
+                else:
+                    o, last_recurrent_state, h_out = fused_recurrent_inference_fwd(
+                        query, key, value, g=g, beta=beta,
+                        initial_state=recurrent_state if use_precomputed_states else None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                
+                if cache_params is not None:
+                    if h_out is not None:
+                        cache_params.layers[li].h_out_all = h_out
+                    cache_params.update_recurrent_state(last_recurrent_state, li)
+
+                core_attn_out = o.reshape(-1, gdn_ref.head_v_dim)
+                z = z.reshape(-1, gdn_ref.head_v_dim)
+                core_attn_out = gdn_ref.norm(core_attn_out, z)
+                core_attn_out = core_attn_out.reshape(batch_size, slen, -1)
+                return gdn_ref.out_proj(core_attn_out)
+            return wrapper
+            
+        gdn.forward = make_inference_wrapper(i, gdn, gdn.conv_kernel_size)
+
+    def crop_cache(cache, seq_len):
+        for layer in cache.layers:
+            if hasattr(layer, "cumulative_length"):
+                layer.cumulative_length = torch.tensor(seq_len, device=device)
+
+    try:
+        from transformers.cache_utils import StaticCache
+
+        for batch in val_dataloader:
+            if examples_processed >= max_examples:
+                break
+            input_ids = batch["ar_input_ids"].to(device)
+            attention_mask = batch["ar_attention_mask"].to(device)
+            B = input_ids.shape[0]
+
+            for i in range(B):
                 if examples_processed >= max_examples:
                     break
-                seq_len = attention_mask[i].sum().item()
+                seq_len = int(attention_mask[i].sum().item())
                 if seq_len < 64:
                     continue
 
-                # Use first 256 tokens as prompt, generate up to max_tokens_per_example
-                prompt_len = min(256, int(seq_len))
+                seq_list = input_ids[i, :seq_len].tolist()
+                found_idx = -1
+                n_assist = len(assistant_tokens)
+                for j in range(len(seq_list) - n_assist + 1):
+                    if seq_list[j:j+n_assist] == assistant_tokens:
+                        found_idx = j + n_assist
+                        break
+                
+                if found_idx != -1:
+                    prompt_len = found_idx
+                else:
+                    # Fallback to default behavior if no chat template is found
+                    prompt_len = min(256, seq_len)
+
                 prompt_ids = input_ids[i, :prompt_len]
                 current_len = prompt_len
+                max_cache_len = prompt_len + max_tokens_per_example + 10
 
-                # AR prefill (1 forward pass, gives hidden states)
-                ar_kv_cache, ar_hidden = model.forward_ar_prefill(prompt_ids.unsqueeze(0))
-                past_kv = ar_kv_cache
-                total_passes += 1
+                past_kv = StaticCache(
+                    config=model.config,
+                    max_batch_size=1,
+                    max_cache_len=max_cache_len,
+                    device=device,
+                    dtype=dtype
+                )
 
-                first_logits = model.lm_head(ar_hidden[:, -1, :])
+                # AR prefill
+                position_ids = torch.arange(prompt_len, device=device).unsqueeze(0)
+                base_outputs = model.base_model(
+                    input_ids=prompt_ids.unsqueeze(0),
+                    position_ids=position_ids,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    logits_to_keep=1
+                )
+                past_kv = base_outputs.past_key_values
+                first_logits = base_outputs.logits[:, -1, :]
                 first_token = first_logits.argmax(dim=-1).item()
                 generated = [first_token]
+                total_passes += 1
                 total_tokens_gen += 1
 
-                for _ in range(max_tokens_per_example // K + 1):
+                while True:
                     if len(generated) >= max_tokens_per_example:
                         break
 
@@ -970,48 +1081,45 @@ def evaluate_acceptance_rate(
                     if diff_len <= 1:
                         break
 
-                    # Build diffusion block
                     anchor_token = generated[-1]
-                    diff_block = torch.full(
-                        (1, diff_len), mask_id, dtype=torch.long, device=device
-                    )
+                    diff_block = torch.full((1, diff_len), mask_id, dtype=torch.long, device=device)
                     diff_block[:, 0] = anchor_token
 
-                    # Causal limit
                     causal_limit = torch.zeros(1, diff_len, dtype=torch.long, device=device)
                     for k in range(diff_len):
-                        causal_limit[0, k] = current_len - 1  # match training: mask sees AR only before anchor
+                        causal_limit[0, k] = current_len - 1
 
-                    # Diffusion projection (1 forward pass)
-                    diff_logits = model.forward_diffusion(
-                        diff_input_ids=diff_block,
+                    # Diffusion projection
+                    diff_logits = model(
+                        input_ids=diff_block,
+                        is_diffusion_pass=True,
                         ar_past_key_values=past_kv,
                         ar_seq_len=current_len,
                         causal_limit=causal_limit,
+                        use_flex=False,
                     )
                     total_passes += 1
 
-                    # Greedy predictions
                     if diff_len > 1:
-                        diff_preds = diff_logits[0, 1:diff_len].argmax(dim=-1).tolist()
+                        diff_preds = diff_logits[0, :-1].argmax(dim=-1).tolist()
                     else:
                         diff_preds = []
                     proposed = [anchor_token] + diff_preds
 
-                    # AR verification (1 forward pass)
+                    # AR verification
                     proposed_tensor = torch.tensor([proposed], dtype=torch.long, device=device)
-                    ar_pos_ids = torch.arange(current_len, current_len + len(proposed),
-                                              device=device).unsqueeze(0)
+                    ar_pos_ids = torch.arange(current_len, current_len + len(proposed), device=device).unsqueeze(0)
+                    
                     ar_outputs = model.base_model(
                         proposed_tensor, position_ids=ar_pos_ids,
                         past_key_values=past_kv, use_cache=True,
                     )
                     total_passes += 1
-                    ar_logits = ar_outputs.logits[0]  # [block_len, vocab]
+                    ar_logits = ar_outputs.logits[0]
                     past_kv = ar_outputs.past_key_values
 
                     # Greedy consensus
-                    accepted = [proposed[0]]  # anchor always accepted
+                    accepted = [proposed[0]]
                     for k in range(1, len(proposed)):
                         ar_pred = ar_logits[k - 1].argmax().item()
                         offset_tested[k] += 1
@@ -1022,30 +1130,56 @@ def evaluate_acceptance_rate(
                             accepted.append(ar_pred)
                             break
 
-                    acceptance_len = len(accepted)
-                    total_acceptances.append(acceptance_len)
+                    valid_tokens = len(accepted) - 1
+                    total_acceptances.append(valid_tokens)
 
-                    generated.extend(accepted)
-                    current_len += acceptance_len
-                    past_kv.crop(current_len)
-                    total_tokens_gen += acceptance_len
+                    # State Slicing Rollback
+                    end_idx = current_len + valid_tokens
+                    crop_cache(past_kv, end_idx)
+
+                    for li in linear_layer_indices:
+                        lc = past_kv.layers[li]
+                        h_out_all = lc.h_out_all
+                        lc.recurrent_states = h_out_all[:, valid_tokens - 1].clone()
+                        
+                        prev_conv_len = lc.conv_states.shape[-1]
+                        end_conv = prev_conv_len + valid_tokens
+                        start_conv = end_conv - prev_conv_len
+                        lc.conv_states = lc.pre_conv_mixed_qkv[:, :, start_conv : end_conv].clone()
+
+                    generated.extend(accepted[1:])
+                    current_len += valid_tokens
+                    total_tokens_gen += valid_tokens
 
                 examples_processed += 1
+                
+                # Cleanup manually to prevent leak across examples
+                del past_kv
 
+    finally:
+        # Restore original forward methods
+        for i in linear_layer_indices:
+            gdn = model.base_model.model.layers[i].linear_attn
+            if saved_forwards[i] is None:
+                if 'forward' in gdn.__dict__:
+                    del gdn.forward
+            else:
+                gdn.forward = saved_forwards[i]
+
+    torch.cuda.empty_cache()
     model.train()
     if not total_acceptances:
         return {"acceptance_rate": 0.0, "avg_acceptance_len": 0.0, "offset_rates": []}
 
     avg_accept_len = sum(total_acceptances) / len(total_acceptances)
-    # Exclude anchor from rate: anchor is always accepted, so floor is 1.0
-    # Rate = fraction of K-1 predicted tokens that were accepted
-    accept_rate = max(0, avg_accept_len - 1) / (K - 1)
+    accept_rate = avg_accept_len / (K - 1)
     tpf = total_tokens_gen / max(total_passes, 1)
     return {
         "acceptance_rate": accept_rate,
         "avg_acceptance_len": avg_accept_len,
         "num_blocks": len(total_acceptances),
         "tpf": tpf,
+        "total_tokens_gen": total_tokens_gen,
         "offset_rates": [
             (offset_accepted[k] / offset_tested[k]) if offset_tested[k] > 0 else 0.0
             for k in range(1, K + 1)

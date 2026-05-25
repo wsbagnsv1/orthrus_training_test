@@ -1,5 +1,5 @@
 """
-Interactive CLI inference for OrthrusSmolLM2 with color-coded consensus visualization.
+Interactive CLI inference for OrthrusQwen35 with color-coded consensus visualization.
 
 Green  = token was predicted correctly by the diffusion head & accepted by AR consensus
 White  = anchor tokens, AR-corrected tokens, and first AR token (default)
@@ -35,12 +35,12 @@ from transformers.cache_utils import DynamicCache
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from model import OrthrusSmolLM2
+from model import OrthrusQwen35Model
 
 # ── ANSI color codes ─────────────────────────────────────────────────────────
 GREEN = "\033[92m"
 CYAN = "\033[96m"
-YELLOW = "\033[93m"
+YELLOW = "\033[91m"  # actually red — better visibility
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -82,7 +82,7 @@ class TokenSpan:
 
 @torch.no_grad()
 def generate_colored(
-    model: OrthrusSmolLM2,
+    model: OrthrusQwen35Model,
     tokenizer,
     prompt: str,
     max_new_tokens: int = 256,
@@ -130,14 +130,144 @@ def generate_colored(
     token_spans: List[TokenSpan] = []
 
     # ── AR Prefill (shared KV cache) ────────────────────────────────────
+    from transformers.cache_utils import StaticCache
+    import types
+    
+    max_cache_len = prompt_len + max_new_tokens + 10
+    past_key_values = StaticCache(
+        config=model.base_model.config,
+        max_batch_size=1,
+        max_cache_len=max_cache_len,
+        device=device,
+        dtype=model.base_model.dtype
+    )
+    
+    def static_cache_crop(self, max_length: int):
+        for layer in self.layers:
+            if hasattr(layer, "cumulative_length"):
+                layer.cumulative_length.fill_(max_length)
+                
+    past_key_values.crop = types.MethodType(static_cache_crop, past_key_values)
+
     position_ids = torch.arange(prompt_len, device=device).unsqueeze(0)
-    base_out = model.base_model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+    base_out = model.base_model(
+        input_ids=input_ids, 
+        position_ids=position_ids, 
+        past_key_values=past_key_values, 
+        use_cache=True,
+        logits_to_keep=1
+    )
     past_key_values = base_out.past_key_values
 
     # First token from prefill logits
     first_logits = base_out.logits[:, -1, :]
     next_token, _ = sample_token(first_logits, temperature)
     next_token_id = next_token.item()
+
+    # ── Wrap Gated Delta Net to extract intermediate states ────────────
+    import transformers.models.qwen3_5.modeling_qwen3_5 as _q35m
+    from inference_kernel import fused_recurrent_inference_fwd
+
+    linear_layer_indices = [
+        i for i, lt in enumerate(model.config.layer_types)
+        if lt == "linear_attention"
+    ]
+    
+    saved_forwards = {}
+    for i in linear_layer_indices:
+        layer = model.base_model.model.layers[i]
+        gdn = layer.linear_attn
+        saved_forwards[i] = gdn.forward
+
+        def make_inference_wrapper(li, gdn_ref, ks_ref):
+            def wrapper(hidden_states, cache_params=None, attention_mask=None):
+                # Standard Qwen3.5 GatedDeltaNet logic
+                hidden_states = _q35m.apply_mask_to_padding_states(hidden_states, attention_mask)
+                batch_size, slen, _ = hidden_states.shape
+                use_precomputed_states = cache_params is not None and cache_params.has_previous_state(li)
+                if use_precomputed_states:
+                    conv_state = cache_params.layers[li].conv_states
+                    recurrent_state = cache_params.layers[li].recurrent_states
+
+                mixed_qkv = gdn_ref.in_proj_qkv(hidden_states)
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+
+                z = gdn_ref.in_proj_z(hidden_states)
+                z = z.reshape(batch_size, slen, -1, gdn_ref.head_v_dim)
+                b = gdn_ref.in_proj_b(hidden_states)
+                a = gdn_ref.in_proj_a(hidden_states)
+
+                if use_precomputed_states and slen == 1:
+                    mixed_qkv = gdn_ref.causal_conv1d_update(
+                        mixed_qkv, conv_state, gdn_ref.conv1d.weight.squeeze(1),
+                        gdn_ref.conv1d.bias, gdn_ref.activation,
+                    )
+                else:
+                    if use_precomputed_states:
+                        mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
+                    
+                    if cache_params is not None:
+                        # Save pre-conv mixed_qkv so we can crop conv state later
+                        cache_params.layers[li].pre_conv_mixed_qkv = mixed_qkv.clone()
+                        new_conv_state = F.pad(mixed_qkv, (ks_ref - mixed_qkv.shape[-1], 0))
+                        cache_params.update_conv_state(new_conv_state, li)
+                    
+                    if gdn_ref.causal_conv1d_fn is not None:
+                        mixed_qkv = gdn_ref.causal_conv1d_fn(
+                            x=mixed_qkv, weight=gdn_ref.conv1d.weight.squeeze(1),
+                            bias=gdn_ref.conv1d.bias, activation=gdn_ref.activation, seq_idx=None,
+                        )
+                    else:
+                        mixed_qkv = F.silu(gdn_ref.conv1d(mixed_qkv)[:, :, :mixed_qkv.shape[-1]])
+                    if use_precomputed_states:
+                        mixed_qkv = mixed_qkv[:, :, -slen:]
+
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+                qkv_splits = [gdn_ref.key_dim, gdn_ref.key_dim, gdn_ref.value_dim]
+                query, key, value = torch.split(mixed_qkv, qkv_splits, dim=-1)
+                query = query.reshape(batch_size, slen, -1, gdn_ref.head_k_dim)
+                key = key.reshape(batch_size, slen, -1, gdn_ref.head_k_dim)
+                value = value.reshape(batch_size, slen, -1, gdn_ref.head_v_dim)
+
+                beta = b.sigmoid()
+                g = -gdn_ref.A_log.float().exp() * F.softplus(a.float() + gdn_ref.dt_bias)
+                if gdn_ref.num_v_heads // gdn_ref.num_k_heads > 1:
+                    query = query.repeat_interleave(gdn_ref.num_v_heads // gdn_ref.num_k_heads, dim=2)
+                    key = key.repeat_interleave(gdn_ref.num_v_heads // gdn_ref.num_k_heads, dim=2)
+
+                # Use our custom inference kernel to get ALL intermediate states, BUT only for short blocks!
+                if slen > 128:
+                    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
+                    o, last_recurrent_state = chunk_gated_delta_rule(
+                        query, key, value, g=g, beta=beta,
+                        initial_state=recurrent_state if use_precomputed_states else None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    h_out = None
+                else:
+                    from inference_kernel import fused_recurrent_inference_fwd
+                    o, last_recurrent_state, h_out = fused_recurrent_inference_fwd(
+                        query, key, value, g=g, beta=beta,
+                        initial_state=recurrent_state if use_precomputed_states else None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                
+                if cache_params is not None:
+                    # Save intermediate recurrent states for slicing later (only matters during generation)
+                    if h_out is not None:
+                        cache_params.layers[li].h_out_all = h_out
+                    cache_params.update_recurrent_state(last_recurrent_state, li)
+
+                core_attn_out = o.reshape(-1, gdn_ref.head_v_dim)
+                z = z.reshape(-1, gdn_ref.head_v_dim)
+                core_attn_out = gdn_ref.norm(core_attn_out, z)
+                core_attn_out = core_attn_out.reshape(batch_size, slen, -1)
+                return gdn_ref.out_proj(core_attn_out)
+            return wrapper
+            
+        gdn.forward = make_inference_wrapper(i, gdn, gdn.conv_kernel_size)
 
     start_idx = prompt_len
     output_ids[:, start_idx] = next_token_id
@@ -166,6 +296,10 @@ def generate_colored(
     block_num = 0
     max_acceptance_len = 0
     max_block_start = 0  # position index in token_spans where max block starts
+    
+    K = model.block_size
+    offset_accepted = [0] * (K + 1)
+    offset_tested = [0] * (K + 1)
 
     # ── Generation loop ─────────────────────────────────────────────────
     while start_idx < max_len - 1:
@@ -204,110 +338,77 @@ def generate_colored(
         # Proposed block = anchor + diffusion predictions
         proposed_block = torch.cat([output_ids[:, start_idx:start_idx+1], diff_tokens], dim=1)
 
-        # ── Step 2: AR verification — batch pass for consensus only ──
-        # (Batch AR may have bf16 drift; KVs will be discarded after consensus.)
-        ar_outputs = model.base_model(
-            input_ids=proposed_block,
-            position_ids=diff_position_ids,
-            past_key_values=past_key_values,
-            use_cache=True,
+        # ── Step 2: AR verification — DUAL-PASS hybrid ──
+        # 1. Save tiny recurrent states (6MB) — avoids 1GB KV deepcopy
+        linear_indices = [i for i in range(len(past_key_values.layers))
+                          if hasattr(past_key_values.layers[i], 'is_recurrent_states_initialized')
+                          and past_key_values.layers[i].is_recurrent_states_initialized]
+        saved_recurrent = {}
+        saved_conv = {}
+        for li in linear_indices:
+            lc = past_key_values.layers[li]
+            saved_recurrent[li] = lc.recurrent_states.clone()
+            if lc.is_conv_states_initialized:
+                saved_conv[li] = lc.conv_states.clone()
+
+        # 2. Batch AR forward (proposed_block → logits)
+        ar_pos_ids = torch.arange(start_idx, start_idx + proposed_block.shape[1],
+                                  device=device).unsqueeze(0)
+        ar_out = model.base_model(
+            input_ids=proposed_block, position_ids=ar_pos_ids,
+            past_key_values=past_key_values, use_cache=True,
         )
-        ar_logits = ar_outputs.logits  # [1, K, vocab]
-        ar_tokens, ar_probs = sample_token(ar_logits, temperature)  # [1, K]
+        ar_logits = ar_out.logits[0]  # [block_len, vocab]
         total_forward_passes += 1
 
-        # ── Step 3: Consensus ────────────────────────────────────────────
-        # ar_tokens[0, k] predicts position start_idx + k + 1
-        # diff_tokens[0, k] predicts position start_idx + k + 1 too
-        # So diff_tokens should match ar_tokens[:, :-1]
-        if diff_tokens.shape[1] > 0:
-            if temperature < 1e-5:
-                matches = (diff_tokens == ar_tokens[:, :-1])  # [1, K-1]
-                acceptance_len = int(matches.cumprod(dim=1).sum(dim=1)[0].item())
-
-                # Track per-token consensus for coloring
-                for i in range(acceptance_len):
-                    consensus_accepts += 1
-                    consensus_total += 1
-                if acceptance_len < diff_tokens.shape[1]:
-                    consensus_total += 1  # the rejected one
-                rejected_at = acceptance_len if acceptance_len < diff_tokens.shape[1] else -1
-
-                next_token_corrected = ar_tokens[:, acceptance_len:acceptance_len+1]
+        # 3. Greedy consensus check
+        acceptance_len = 0
+        for k in range(1, proposed_block.shape[1]):
+            ar_pred = ar_logits[k - 1].argmax().item()
+            offset_tested[k] += 1
+            if proposed_block[0, k].item() == ar_pred:
+                acceptance_len += 1
+                consensus_accepts += 1
+                consensus_total += 1
+                offset_accepted[k] += 1
             else:
-                matches = None
-                acceptance_len = 0
-                for i in range(diff_tokens.shape[1]):
-                    q_prob = diff_probs[0, i, diff_tokens[0, i]] if diff_probs is not None else 1.0
-                    p_prob = ar_probs[0, i, diff_tokens[0, i]] if ar_probs is not None else 1.0
-                    if torch.rand(1, device=device).item() < min(1.0, (p_prob / max(q_prob, 1e-8)).item()):
-                        acceptance_len += 1
-                    else:
-                        break
-                if acceptance_len < diff_tokens.shape[1]:
-                    p_dist = ar_probs[0, acceptance_len]
-                    residual = torch.clamp(p_dist - diff_probs[0, acceptance_len], min=0.0)
-                    residual_sum = residual.sum()
-                    next_token_corrected = torch.multinomial(
-                        residual / residual_sum if residual_sum > 1e-5 else p_dist, 1
-                    ).unsqueeze(0)
-                else:
-                    next_token_corrected = ar_tokens[:, acceptance_len:acceptance_len+1]
-        else:
-            matches = None
-            acceptance_len = 0
-            next_token_corrected = ar_tokens[:, :1]
+                consensus_total += 1
+                break
 
-        all_acceptance_lengths.append(acceptance_len + 1)  # +1 for anchor
+        all_acceptance_lengths.append(acceptance_len)
 
-        # ── Debug: show consensus details ───────────────────────────────
-        if debug and diff_tokens.shape[1] > 0:
-            sys.stderr.write(f"\n{DIM}[Block {block_num} debug] start_idx={start_idx}{RESET}\n")
-            sys.stderr.write(f"  Proposed ({diff_tokens.shape[1]} tokens): ")
-            for i, tid in enumerate(diff_tokens[0].tolist()):
-                t = tokenizer.decode([tid], skip_special_tokens=True)
-                marker = "✓" if i < acceptance_len else ("✗" if i == acceptance_len else " ")
-                sys.stderr.write(f"{marker}{t!r} ")
-            sys.stderr.write(f"\n  AR tokens  ({ar_tokens.shape[1]-1} predictions): ")
-            for i, tid in enumerate(ar_tokens[0, :-1].tolist()):
-                t = tokenizer.decode([tid], skip_special_tokens=True)
-                marker = "✓" if i < acceptance_len else ("✗" if i == acceptance_len else " ")
-                sys.stderr.write(f"{marker}{t!r} ")
-            sys.stderr.write(f"\n  Matches: {matches[0].tolist() if matches is not None else 'N/A'}")
-            sys.stderr.write(f"\n  Accepted: {acceptance_len}, Correction: ")
-            sys.stderr.write(f"{tokenizer.decode([int(next_token_corrected[0, 0].item())], skip_special_tokens=True)!r}")
-
-            # Diagnostic: run pure AR one-token-at-a-time from this start_idx
-            # to compare what the model SHOULD predict vs what batch-AR predicts
-            if block_num <= 3:
-                sys.stderr.write(f"\n  {YELLOW}Pure-AR trace from position {start_idx}:{RESET}\n")
-                diag_pkv = DynamicCache()
-                diag_ids = output_ids[:, :start_idx].clone()
-                diag_pos = torch.arange(start_idx, device=device).unsqueeze(0)
-                diag_out = model.base_model(input_ids=diag_ids, position_ids=diag_pos, use_cache=True)
-                diag_pkv = diag_out.past_key_values
-                diag_next = diag_out.logits[:, -1, :].argmax(dim=-1).item()
-                sys.stderr.write(f"    pos {start_idx}: {tokenizer.decode([diag_next], skip_special_tokens=True)!r}")
-                for diag_i in range(1, min(6, diff_tokens.shape[1] + 2)):
-                    tok_t = torch.tensor([[diag_next]], dtype=torch.long, device=device)
-                    pos_t = torch.tensor([[start_idx + diag_i - 1]], dtype=torch.long, device=device)
-                    diag_out = model.base_model(input_ids=tok_t, position_ids=pos_t, past_key_values=diag_pkv, use_cache=True)
-                    diag_pkv = diag_out.past_key_values
-                    diag_next = diag_out.logits[:, -1, :].argmax(dim=-1).item()
-                    sys.stderr.write(f" → {tokenizer.decode([diag_next], skip_special_tokens=True)!r}")
-                sys.stderr.write(f"\n    Batch-AR said: ")
-                for diag_i in range(min(6, ar_tokens.shape[1])):
-                    bt = tokenizer.decode([int(ar_tokens[0, diag_i].item())], skip_special_tokens=True)
-                    sys.stderr.write(f" → {bt!r}")
-                sys.stderr.write(f"\n")
-            sys.stderr.write(f"\n")
-
-        # ── Step 4: Commit accepted tokens (reference approach) ─────────
-        # float32 AR backbone → batch KVs are bit-exact, no replay needed.
+        # 4. State slicing (Fast cache rollback)
+        # We ALREADY have the cache up to the full proposed block!
+        # Just crop KV cache to the accepted length (anchor + accepted)
         end_idx = start_idx + acceptance_len + 1
-        accepted_block = proposed_block[:, :acceptance_len + 1]
-        output_ids[:, start_idx:end_idx] = accepted_block
         past_key_values.crop(end_idx)
+
+        for li in linear_indices:
+            lc = past_key_values.layers[li]
+            gdn = model.base_model.model.layers[li].linear_attn
+            
+            # Revert recurrent states to the state immediately after processing the accepted block
+            # h_out_all has shape [1, block_len, HV, K, V]
+            # State after anchor is index 0. State after acceptance_len is at index acceptance_len.
+            h_out_all = lc.h_out_all
+            lc.recurrent_states = h_out_all[:, acceptance_len].clone()
+            
+            # Revert conv_states
+            prev_conv_len = lc.conv_states.shape[-1]
+            accepted_tokens_len = acceptance_len + 1
+            # pre_conv_mixed_qkv has length `prev_conv_len + block_len`
+            end_conv = prev_conv_len + accepted_tokens_len
+            start_conv = end_conv - prev_conv_len
+            lc.conv_states = lc.pre_conv_mixed_qkv[:, :, start_conv : end_conv].clone()
+
+        # 5. Skip third pass! Corrected logits are already computed in Step 2.
+        accepted_block = proposed_block[:, :acceptance_len + 1]
+        ar_logits_corrected = ar_logits[:acceptance_len + 1]
+
+        # 6. Correction token from AR at final position
+        next_token_corrected_id = ar_logits_corrected[-1].argmax().item()
+        next_token_corrected = torch.tensor([[next_token_corrected_id]], dtype=torch.long, device=device)
+        output_ids[:, start_idx:end_idx] = accepted_block
 
         # Record token spans for coloring
         # Position 0 = anchor (always accepted, not colored)
@@ -326,7 +427,8 @@ def generate_colored(
             for i in range(1, acceptance_len + 1):
                 text = tokenizer.decode([int(accepted_block[0, i].item())], skip_special_tokens=True)
                 if text:
-                    sys.stdout.write(f"{GREEN}{text}{RESET}")
+                    disp = text.replace('\n', '\\n\n').replace('\r', '\\r\r').replace('\t', '\\t').replace(' ', '·')
+                    sys.stdout.write(f"{GREEN}{disp}{RESET}")
                     sys.stdout.flush()
 
             if verbose and acceptance_len > 0:
@@ -357,7 +459,8 @@ def generate_colored(
             if stream:
                 corr_text = tokenizer.decode([next_tok_id], skip_special_tokens=True)
                 if corr_text:
-                    sys.stdout.write(corr_text)
+                    disp = corr_text.replace('\n', '\\n\n').replace('\r', '\\r\r').replace('\t', '\\t').replace(' ', '·')
+                    sys.stdout.write(disp)
                     sys.stdout.flush()
 
             if next_tok_id == eos_id:
@@ -389,6 +492,9 @@ def generate_colored(
         "consensus_total": max(consensus_total, 1),
         "consensus_rate": consensus_accepts / max(consensus_total, 1),
         "time_ms": elapsed_ms,
+        "offset_accepted": offset_accepted,
+        "offset_tested": offset_tested,
+        "K": K,
     }
 
     return output, stats, token_spans
@@ -398,7 +504,7 @@ def generate_colored(
 
 @torch.no_grad()
 def generate_ar_only(
-    model: OrthrusSmolLM2,
+    model: OrthrusQwen35Model,
     tokenizer,
     prompt: str,
     max_new_tokens: int = 256,
@@ -428,7 +534,7 @@ def generate_ar_only(
 
     # Prefill + get first token logits
     position_ids = torch.arange(prompt_len, device=device).unsqueeze(0)
-    base_outputs = model.base_model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+    base_outputs = model.base_model(input_ids=input_ids, position_ids=position_ids, use_cache=True, logits_to_keep=1)
     past_kv = base_outputs.past_key_values
     first_logits = base_outputs.logits[:, -1, :]
     first_token, _ = sample_token(first_logits, temperature)
@@ -500,15 +606,24 @@ def generate_ar_only(
 def print_colored_output(token_spans: List[TokenSpan], tokenizer):
     """Print the full output with green highlights for consensus-accepted tokens."""
     print(f"\n{BOLD}── Generated ──{RESET}")
+    yellow_count = 0
     for span in token_spans:
         text = tokenizer.decode([span.token_id], skip_special_tokens=True)
         if not text:
             continue
-        if span.accepted:
-            print(f"{GREEN}{text}{RESET}", end="")
+            
+        # Make whitespaces visible
+        display_text = text.replace('\n', '\\n\n').replace('\r', '\\r\r').replace('\t', '\\t').replace(' ', '·')
+            
+        if span.is_max_block:
+            yellow_count += 1
+            print(f"{YELLOW}{display_text}{RESET}", end="")
+        elif span.accepted:
+            print(f"{GREEN}{display_text}{RESET}", end="")
         else:
-            print(text, end="")
+            print(display_text, end="")
     print()
+    print(f"{DIM}[max block tokens: {yellow_count}]{RESET}")
 
 
 def print_comparison(orthrus_stats: dict, ar_stats: dict, orthrus_output: str, ar_output: str,
@@ -536,12 +651,28 @@ def print_comparison(orthrus_stats: dict, ar_stats: dict, orthrus_output: str, a
     print(f"    AR-only: {ar_stats['tokens_generated']} tokens generated")
 
     # Consensus detail
+    # Consensus detail
     if "consensus_rate" in orthrus_stats:
+        K = orthrus_stats["K"]
+        avg_accept_len = orthrus_stats["avg_acceptance"]
+        accept_rate = avg_accept_len / (K - 1)
+        
+        offset_accepted = orthrus_stats["offset_accepted"]
+        offset_tested = orthrus_stats["offset_tested"]
+        offset_rates = [
+            (offset_accepted[k] / offset_tested[k]) if offset_tested[k] > 0 else 0.0
+            for k in range(1, K)
+        ]
+        
+        off_str_parts = []
+        for k, rate in enumerate(offset_rates, 1):
+            if rate > 0:
+                off_str_parts.append(f"{k}:{rate:.0%}")
+        off_str = " ".join(off_str_parts)
+
         print(f"\n  {BOLD}Consensus:{RESET}")
-        print(f"    Accepts:  {orthrus_stats['consensus_accepts']}/{orthrus_stats['consensus_total']} "
-              f"({orthrus_stats['consensus_rate']:.1%})")
-        print(f"    Avg acc:  {orthrus_stats['avg_acceptance']:.1f} tokens/block")
-        print(f"    Max acc:  {orthrus_stats['max_acceptance']} tokens/block")
+        print(f"    rate: {accept_rate:.2%} | avg_len: {avg_accept_len:.1f}/{K} | "
+              f"blocks: {len(orthrus_stats['acceptance_lengths'])} | off: {off_str}")
 
     # Output match
     match = orthrus_output.strip() == ar_output.strip()
@@ -555,18 +686,20 @@ def print_comparison(orthrus_stats: dict, ar_stats: dict, orthrus_output: str, a
     print(f"{BOLD}  {CYAN}Orthrus (green = consensus-accepted){RESET}")
     print(f"{BOLD}{'─'*60}{RESET}")
     if token_spans and tokenizer:
+        yellow_count = 0
         for span in token_spans:
             text = tokenizer.decode([span.token_id], skip_special_tokens=True)
             if not text:
                 continue
             if span.is_max_block:
+                yellow_count += 1
                 print(f"{YELLOW}{text}{RESET}", end="")
             elif span.accepted:
                 print(f"{GREEN}{text}{RESET}", end="")
             else:
                 print(text, end="")
         print()
-        print(f"\n{DIM}  {GREEN}Green{RESET}{DIM} = accepted  |  {YELLOW}Yellow{RESET}{DIM} = max block ({orthrus_stats.get('max_acceptance', 0)} tokens){RESET}")
+        print(f"\n{DIM}  {GREEN}Green{RESET}{DIM} = accepted  |  {YELLOW}Red{RESET}{DIM} = max block ({orthrus_stats.get('max_acceptance', 0)} tokens) [actual: {yellow_count}]{RESET}")
     else:
         print(orthrus_output)
 
@@ -594,8 +727,8 @@ def print_stats(stats: dict):
 
 # ── model loading ────────────────────────────────────────────────────────────
 
-def load_model(checkpoint_path: str, base_model: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-               K: int = 32, deterministic: bool = False) -> Tuple[OrthrusSmolLM2, AutoTokenizer]:
+def load_model(checkpoint_path: str, base_model: str = "F:/Users/timbe/Desktop/Orthrus/Qwen3.5-0.8B",
+               K: int = 32, deterministic: bool = False) -> Tuple[OrthrusQwen35Model, AutoTokenizer]:
     """Load Orthrus model with trained diffusion heads."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -606,12 +739,11 @@ def load_model(checkpoint_path: str, base_model: str = "HuggingFaceTB/SmolLM2-13
         tokenizer.add_special_tokens({"additional_special_tokens": ["<mask>"]})
 
     print(f"{DIM}Loading base model ({base_model})...{RESET}")
-    model = OrthrusSmolLM2(
-        base_model_name=base_model,
+    model = OrthrusQwen35Model(
+        base_model_path=base_model,
         block_size=K,
         dtype=dtype,
     )
-    model.base_model.resize_token_embeddings(len(tokenizer))
 
     print(f"{DIM}Loading diffusion heads from {checkpoint_path}...{RESET}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -717,9 +849,11 @@ if __name__ == "__main__":
                         default="../checkpoints/step_6000/diffusion_heads.pt",
                         help="Path to diffusion_heads.pt checkpoint")
     parser.add_argument("--base_model", type=str,
-                        default="HuggingFaceTB/SmolLM2-135M-Instruct")
+                        default="F:/Users/timbe/Desktop/Orthrus/Qwen3.5-0.8B")
     parser.add_argument("--prompt", type=str, default=None,
                         help="One-shot prompt (omit for interactive REPL)")
+    parser.add_argument("--prompt-file", type=str, default=None,
+                        help="Read prompt from a text file")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--K", type=int, default=32, help="Block size")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -731,6 +865,8 @@ if __name__ == "__main__":
                         help="Random seed for AR-only baseline reproducibility")
     parser.add_argument("--debug", action="store_true",
                         help="Show per-block consensus debug details")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Launch interactive REPL loop instead of running a one-shot prompt")
     parser.add_argument("--deterministic", action="store_true",
                         help="Use math SDPA backend for bit-exact batch vs sequential")
     args = parser.parse_args()
@@ -751,44 +887,83 @@ if __name__ == "__main__":
         deterministic=args.deterministic,
     )
 
-    if args.prompt:
-        # Wrap in chat template for instruct behavior
-        prompt = args.prompt
-        if '<|im_start|>' not in prompt:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": args.prompt}],
-                tokenize=False, add_generation_prompt=True
-            )
+    if args.prompt_file:
+        with open(args.prompt_file, 'r', encoding='utf-8') as f:
+            args.prompt = f.read().strip()
 
-        # One-shot mode
-        orthrus_output, orthrus_stats, spans = generate_colored(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            verbose=args.verbose,
-            stream=True,
-            debug=args.debug,
-            deterministic=args.deterministic,
-        )
-        print()
+    if args.interactive:
+        # Interactive REPL
+        interactive_loop(model, tokenizer, args)
+    else:
+        if not args.prompt:
+            print(f"{DIM}── Loading standard evaluation prompt from dataset... ──{RESET}")
+            try:
+                from data import load_orthrus_dataset
+                val_ds, text_key = load_orthrus_dataset(
+                    dataset_name="HuggingFaceTB/smoltalk",
+                    config_name="all",
+                    split="test",
+                    max_samples=1,
+                    text_key="text",
+                    tokenizer=tokenizer,
+                )
+                if val_ds and len(val_ds) > 0:
+                    text = val_ds[0][text_key]
+                    input_ids = tokenizer(text, add_special_tokens=True)["input_ids"]
+                    assistant_tokens = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+                    n_assist = len(assistant_tokens)
+                    found_idx = -1
+                    for j in range(len(input_ids) - n_assist + 1):
+                        if input_ids[j:j+n_assist] == assistant_tokens:
+                            found_idx = j + n_assist
+                            break
+                    
+                    if found_idx != -1:
+                        prompt_ids = input_ids[:found_idx]
+                        args.prompt = tokenizer.decode(prompt_ids)
+                    else:
+                        args.prompt = tokenizer.decode(input_ids[:256])
+                else:
+                    args.prompt = "Could not load eval dataset."
+            except Exception as e:
+                print(f"Failed to load dataset: {e}")
+                args.prompt = "Once upon a time in a faraway land,"
 
-        if args.compare:
-            print(f"{DIM}── Running AR-only baseline... ──{RESET}")
-            ar_output, ar_stats = generate_ar_only(
+        if args.prompt:
+            # Wrap in chat template for instruct behavior (if it wasn't pre-formatted)
+            prompt = args.prompt
+            if '<|im_start|>' not in prompt:
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": args.prompt}],
+                    tokenize=False, add_generation_prompt=True
+                )
+
+            # One-shot mode
+            orthrus_output, orthrus_stats, spans = generate_colored(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
-                seed=args.seed,
+                verbose=args.verbose,
                 stream=True,
+                debug=args.debug,
+                deterministic=args.deterministic,
             )
-            print_comparison(orthrus_stats, ar_stats, orthrus_output, ar_output,
-                             token_spans=spans, tokenizer=tokenizer)
-        else:
-            print_stats(orthrus_stats)
-    else:
-        # Interactive REPL
-        interactive_loop(model, tokenizer, args)
+            print()
+
+            if args.compare:
+                print(f"{DIM}── Running AR-only baseline... ──{RESET}")
+                ar_output, ar_stats = generate_ar_only(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    seed=args.seed,
+                    stream=True,
+                )
+                print_comparison(orthrus_stats, ar_stats, orthrus_output, ar_output,
+                                 token_spans=spans, tokenizer=tokenizer)
+            else:
+                print_stats(orthrus_stats)
