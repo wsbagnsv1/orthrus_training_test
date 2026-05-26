@@ -485,7 +485,8 @@ def generate_colored(
         "forward_passes": total_forward_passes,
         "tpf": len(generated_ids) / max(total_forward_passes, 1),
         "acceptance_lengths": all_acceptance_lengths,
-        "avg_acceptance": sum(all_acceptance_lengths) / len(all_acceptance_lengths) if all_acceptance_lengths else 0,
+        "avg_acceptance": sum(l for l in all_acceptance_lengths if l > 0) / len([l for l in all_acceptance_lengths if l > 0]) if any(l > 0 for l in all_acceptance_lengths) else 0.0,
+        "true_avg_acceptance": sum(all_acceptance_lengths) / len(all_acceptance_lengths) if all_acceptance_lengths else 0.0,
         "max_acceptance": max_acceptance_len,  # just accepted tokens, no anchor
         "max_accepted": max_acceptance_len,
         "consensus_accepts": consensus_accepts,
@@ -655,12 +656,13 @@ def print_comparison(orthrus_stats: dict, ar_stats: dict, orthrus_output: str, a
     if "consensus_rate" in orthrus_stats:
         K = orthrus_stats["K"]
         avg_accept_len = orthrus_stats["avg_acceptance"]
-        accept_rate = avg_accept_len / (K - 1)
+        true_avg_len = orthrus_stats["true_avg_acceptance"]
+        accept_rate = true_avg_len / (K - 1)
         
         offset_accepted = orthrus_stats["offset_accepted"]
-        offset_tested = orthrus_stats["offset_tested"]
+        total_blocks = len(orthrus_stats['acceptance_lengths'])
         offset_rates = [
-            (offset_accepted[k] / offset_tested[k]) if offset_tested[k] > 0 else 0.0
+            (offset_accepted[k] / total_blocks) if total_blocks > 0 else 0.0
             for k in range(1, K)
         ]
         
@@ -712,17 +714,30 @@ def print_comparison(orthrus_stats: dict, ar_stats: dict, orthrus_output: str, a
 
 
 def print_stats(stats: dict):
-    """Print generation statistics."""
-    print(f"\n{BOLD}── Stats ──{RESET}")
-    print(f"  Tokens generated:    {stats['tokens_generated']}")
-    print(f"  Forward passes:      {stats['forward_passes']}")
-    print(f"  TPF (tokens/pass):   {stats['tpf']:.2f}×")
-    print(f"  Avg acceptance len:  {stats['avg_acceptance']:.1f} / K")
-    print(f"  Max acceptance len:  {stats['max_acceptance']} / K")
-    print(f"  Consensus rate:      {stats['consensus_rate']:.1%} "
-          f"({stats['consensus_accepts']}/{stats['consensus_total']})")
-    print(f"  {GREEN}Green{RESET} = diffusion predicted correctly, accepted by AR consensus")
-    print(f"  White = AR-corrected or baseline AR token")
+    """Print standard stats block."""
+    K = stats["K"]
+    avg_accept_len = stats["avg_acceptance"]
+    true_avg_len = stats["true_avg_acceptance"]
+    accept_rate = true_avg_len / (K - 1)
+    
+    offset_accepted = stats["offset_accepted"]
+    total_blocks = len(stats['acceptance_lengths'])
+    offset_rates = [
+        (offset_accepted[k] / total_blocks) if total_blocks > 0 else 0.0
+        for k in range(1, K)
+    ]
+    
+    off_str_parts = []
+    for k, rate in enumerate(offset_rates, 1):
+        if rate > 0:
+            off_str_parts.append(f"{k}:{rate:.0%}")
+    off_str = " ".join(off_str_parts)
+
+    msg = (f"rate: {accept_rate:.2%} | avg_len: {avg_accept_len:.1f}/{K} | "
+           f"TPF: {stats['tpf']:.1f}× | blocks: {total_blocks} | "
+           f"gen_toks: {stats['tokens_generated']} | off: {off_str} <<<")
+           
+    print(f"\n{DIM}>>> Accept @ end | {msg}{RESET}")
 
 
 # ── model loading ────────────────────────────────────────────────────────────

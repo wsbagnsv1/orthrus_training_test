@@ -1171,17 +1171,22 @@ def evaluate_acceptance_rate(
     if not total_acceptances:
         return {"acceptance_rate": 0.0, "avg_acceptance_len": 0.0, "offset_rates": []}
 
-    avg_accept_len = sum(total_acceptances) / len(total_acceptances)
-    accept_rate = avg_accept_len / (K - 1)
+    diffusion_matches = [x - 1 for x in total_acceptances]
+    true_avg_len = sum(diffusion_matches) / len(diffusion_matches)
+    accept_rate = max(0, true_avg_len) / (K - 1)
+    
+    successful_matches = [m for m in diffusion_matches if m > 0]
+    avg_accept_len_non_zero = sum(successful_matches) / len(successful_matches) if successful_matches else 0.0
+    
     tpf = total_tokens_gen / max(total_passes, 1)
     return {
         "acceptance_rate": accept_rate,
-        "avg_acceptance_len": avg_accept_len,
+        "avg_acceptance_len": avg_accept_len_non_zero,
         "num_blocks": len(total_acceptances),
         "tpf": tpf,
         "total_tokens_gen": total_tokens_gen,
         "offset_rates": [
-            (offset_accepted[k] / offset_tested[k]) if offset_tested[k] > 0 else 0.0
+            (offset_accepted[k] / len(total_acceptances)) if len(total_acceptances) > 0 else 0.0
             for k in range(1, K + 1)
         ],
     }# ── CLI ──────────────────────────────────────────────────────────────────────
