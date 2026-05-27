@@ -1,1 +1,1 @@
-# Orthrus for SmolLM2-135M
+# Orthrus for Qwen3.5-0.8B
