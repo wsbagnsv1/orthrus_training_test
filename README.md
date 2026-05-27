@@ -15,5 +15,5 @@ https://github.com/chiennv2000/orthrus
 
 I have added qwen3.5 training into a seperate branch, that one is full of trash and not optimized I intend to clean it up later, since i used gemini to cook up some custom kernels and that was creating a whole lot of test files, but in the end it seems to work decently. The trainig itself is better than pure pytorch training with those kernels but they are far from perfect. Im realtively sure the math behind it works but im not perfect so if you find errors please let me know. Also obviously I intend to clean the codebase up once i have decently optimized and validated it with real world testing (; 
 
-Inference of a qwen3.5 0.8b trained for 40ish steps with the trainins code:
+Inference of a qwen3.5 0.8b orthrus trained for 40ish steps with the trainings code:
 <img width="1900" height="809" alt="Capture" src="https://github.com/user-attachments/assets/f691ce51-fd67-477c-ab37-f01789647c6a" />
