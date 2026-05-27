@@ -1,0 +1,54 @@
+# Orthrus SmolLM2-135M Training Configuration
+# Based on the Orthrus paper (arXiv:2605.12825, Table 4)
+
+model:
+  base_model: "F:/Users/timbe/Desktop/Orthrus/Qwen3.5-0.8B"
+  K: 32                     # Parallel block size
+  dtype: "bfloat16"
+
+training:
+  max_seq_len: 2048
+  B_blocks: 256               # 256 mask blocks per sequence
+  epochs: 2
+  peak_lr: 2.0e-4
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.05
+  gradient_clip: 1.0
+  micro_batch_size: 4
+  gradient_accumulation_steps: 8  # effective batch = 32
+  precision: "bfloat16"
+  compile: false
+  optimizer: "muon"          # "adamw" or "muon"
+  muon_lr_multiplier: 66.7     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+  weight_decay: 0.0         # AdamW weight decay (norms under Muon)
+  muon_weight_decay: 0.0    # Muon weight decay (paper recommends 0.01–0.1)
+  diffusion_chunk_blocks: 16  # spatial micro-batching
+  eval_batch_size: 1            # smaller to avoid OOM during eval
+  teacher_bf16: true          # bf16 storage, fp32 accumulation
+
+  # Logging & checkpointing
+  log_every: 1
+  eval_every: 10
+  acceptance_every: 20
+  save_every: 500
+  output_dir: "./checkpoints"
+
+data:
+  dataset: "HuggingFaceTB/smoltalk"
+  dataset_config: "all"
+  text_key: "text"
+  max_samples: null
+  max_eval_samples: 2000
+  eval_split: "test"
+  min_seq_len: 512            # filter out short samples for richer context
+  mask_token: "<mask>"  # New special token, initialized from mean of all embeddings
+
+  # For multi-dataset (paper uses 1:1:1 Chat:Math:Code), use:
+  # dataset:
+  #   - name: "nvidia/Nemotron-Post-Training-Dataset-v2"
+  #     weight: 1.0
+  #   # Add math + code datasets as available
+
+hardware:
+  device: "cuda"
+  seed: 42
