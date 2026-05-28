@@ -557,14 +557,20 @@ class OrthrusQwen35Model(nn.Module):
         # This is analogous to KV cache: cache at position t contains tokens 0..t,
         # and the model predicts token t+1 (which is NOT in the cache yet).
         anchor_mask = torch.full((B, seq_len), -1, dtype=torch.int32, device=device)
+        duplicate_fixes = []  # (b_idx, copy_to_idx, copy_from_idx) for duplicate anchors
         for b_idx in range(B):
+            pos_to_first_idx = {}
             for idx, pos in enumerate(anchor_positions[b_idx].cpu().tolist()):
                 # Extract state at position BEFORE the anchor
                 # pos is 0-indexed (from collator), so pos-1 is the token right before anchor
                 # The kernel stores state AFTER processing token i, so mark pos-1
                 target_pos = int(pos) - 1
                 if 0 <= target_pos < seq_len:
-                    anchor_mask[b_idx, target_pos] = idx
+                    if target_pos not in pos_to_first_idx:
+                        pos_to_first_idx[target_pos] = idx
+                        anchor_mask[b_idx, target_pos] = idx
+                    else:
+                        duplicate_fixes.append((b_idx, idx, pos_to_first_idx[target_pos]))
 
         linear_layer_indices = [
             i for i, lt in enumerate(self.config.layer_types)
@@ -653,6 +659,12 @@ class OrthrusQwen35Model(nn.Module):
                             k_for_kernel, v_for_kernel, g_for_kernel, beta_for_kernel,
                             anchor_mask, num_anchors, use_qk_l2norm_in_kernel=True,
                         )  # (B, num_anchors, HV, K, V)
+
+                        # Fix duplicate anchors: copy state from first occurrence
+                        if duplicate_fixes:
+                            for b_idx, copy_to, copy_from in duplicate_fixes:
+                                anchor_states[b_idx, copy_to] = anchor_states[b_idx, copy_from]
+
                         linear_states[li] = anchor_states
 
                         # Conv state per anchor: [B, num_anchors, C, ks] buffer per layer
