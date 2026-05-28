@@ -1,8 +1,9 @@
-torch>=2.4.0          # Required for FlexAttention and torch.compile
-transformers>=4.45.0
+torch>=2.8.0          # Required for FlexAttention and torch.compile
+transformers 5.7.0
 datasets
 accelerate
 einops
 tqdm
 pyyaml
 wandb                 # Optional logging
+muon
