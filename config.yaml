@@ -26,6 +26,13 @@ training:
   eval_batch_size: 1            # smaller to avoid OOM during eval
   teacher_bf16: true          # bf16 storage, fp32 accumulation
 
+  # Representation alignment aux loss (cosine sim on hidden states)
+  repr_align: false            # tracks repr even at weight 0
+  repr_align_weight: 0.0       # set >0 to add to loss (e.g. 0.3)
+  repr_align_weight_end: 0.01  # final weight (KL takes over)
+  repr_align_decay_steps: 500  # linear decay over this many steps
+  repr_align_subsample: 0.25   # fraction of valid tokens to subsample
+
   # Logging & checkpointing
   log_every: 1
   eval_every: 10

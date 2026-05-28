@@ -65,6 +65,8 @@ torch._inductor.config.triton.cudagraph_trees = False  # no CUDAGraph overhead
 import signal
 import json
 import time
+import random as python_random
+import numpy
 from pathlib import Path
 
 from tqdm import tqdm
@@ -111,6 +113,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "output_dir": "./checkpoints",
         "diffusion_chunk_blocks": 32,
         "teacher_bf16": True,
+        "repr_align": False,           # enable representation alignment aux loss
+        "repr_align_weight": 0.3,      # starting weight (decayed over training)
+        "repr_align_weight_end": 0.01, # final weight after decay
+        "repr_align_decay_steps": 500, # linearly decay weight over this many steps
+        "repr_align_subsample": 0.25,  # fraction of valid tokens to subsample
     },
     "data": {
         "dataset": "HuggingFaceTB/smoltalk",
@@ -161,7 +168,9 @@ def compute_kl_loss(
     target_ids: torch.Tensor,           # [B, B_blocks*K]
     pad_token_id: int,
     forward_only: bool = False,
-) -> torch.Tensor:
+    repr_weight: float = 0.0,           # representation alignment aux loss weight (0 = off)
+    repr_subsample: float = 0.25,       # fraction of valid tokens to subsample for repr loss
+) -> tuple[torch.Tensor, float]:
     """
     Computes KL distillation using a custom Fused Triton Kernel.
     Valid tokens are filtered first to avoid calculating logits for padding.
@@ -198,9 +207,24 @@ def compute_kl_loss(
             kl_mean = triton_compute_kl_loss_fwd_only(s_valid, t_valid, lm_head.weight)
         else:
             kl_mean = triton_compute_kl_loss(s_valid, t_valid, lm_head.weight)
-        return kl_mean * (s_valid.size(0) / total_tokens)
 
-    return torch.tensor(0.0, device=device, requires_grad=not forward_only)
+        loss = kl_mean * (s_valid.size(0) / total_tokens)
+        repr_val = 0.0
+
+        # ── representation alignment aux loss ───────────────────────────
+        if repr_weight > 0 and not forward_only and s_valid.size(0) > 4:
+            n = s_valid.size(0)
+            k = max(1, int(n * repr_subsample))
+            idx = torch.randperm(n, device=device)[:k]
+            s_norm = F.normalize(s_valid[idx].float(), dim=-1)
+            t_norm = F.normalize(t_valid[idx].float(), dim=-1)
+            repr_loss = 1.0 - (s_norm * t_norm).sum(dim=-1).mean()
+            repr_val = repr_loss.item()
+            loss = loss + repr_weight * repr_loss
+
+        return loss, repr_val
+
+    return torch.tensor(0.0, device=device, requires_grad=not forward_only), 0.0
 
 
 # ── JSONL metrics logger (async via background thread) ──────────────────────
@@ -436,6 +460,14 @@ def train(config: Dict[str, Any]):
         optimizers.append(AdamW(trainable_params, lr=config["training"]["peak_lr"], betas=(0.9, 0.95), fused=True, weight_decay=config["training"].get("weight_decay", 0.0)))
         print(f"  Optimizer: AdamW")
 
+    repr_cfg = config["training"].get("repr_align", False)
+    if repr_cfg:
+        rw = config["training"].get("repr_align_weight", 0.3)
+        rw_end = config["training"].get("repr_align_weight_end", 0.01)
+        rw_decay = config["training"].get("repr_align_decay_steps", 500)
+        rs = config["training"].get("repr_align_subsample", 0.25)
+        print(f"  Repr alignment: ON (weight {rw}→{rw_end} over {rw_decay} steps, subsample={rs})")
+
     optimizer = optimizers[0]  # canonical ref for save/load/scheduler
 
     total_steps = (
@@ -471,7 +503,7 @@ def train(config: Dict[str, Any]):
     schedule_step = 0  # tracks LR schedule position (may differ on batch-size change)
     resume_from = config["training"].get("resume_from")
     if resume_from:
-        start_epoch, global_step = load_checkpoint(model, optimizer, scheduler, resume_from, optimizers=optimizers)
+        start_epoch, global_step, rng_state, dataloader_offset = load_checkpoint(model, optimizer, scheduler, resume_from, optimizers=optimizers)
         # Rebuild scheduler with current config LR (checkpoint LR may differ)
         # Also check saved schedule metadata in case batch size / total steps changed
         schedule_step = global_step  # default: no remapping needed
@@ -507,11 +539,48 @@ def train(config: Dict[str, Any]):
     if config["training"]["compile"]:
         model.compile_diffusion_heads()
 
+    # ── restore RNG + skip DataLoader on resume ──────────────────────────────
+    dataloader_offset = 0
+    if resume_from and rng_state is not None:
+        torch.random.set_rng_state(rng_state["torch_cpu"])
+        if rng_state.get("torch_cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng_state["torch_cuda"])
+        if rng_state.get("python") is not None:
+            import random as _random
+            _random.setstate(rng_state["python"])
+        if rng_state.get("numpy") is not None:
+            try:
+                import numpy as _np
+                _np.random.set_state(rng_state["numpy"])
+            except ImportError:
+                pass
+        print(f"  ✓ RNG states restored")
+        # Compute how many batches to skip within the current epoch
+        n_accum = config["training"]["gradient_accumulation_steps"]
+        batches_consumed = global_step * n_accum
+        dataloader_offset = batches_consumed % len(dataloader)
+        print(f"  Will skip {dataloader_offset} batches to resume DataLoader position")
+
     # ── training loop ────────────────────────────────────────────────────────
     use_scaler = (dtype == torch.float16)
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)  # fp16 needs scaling, bf16 doesn't
     accum_loss = 0.0
+    accum_repr = 0.0
     _profile_step = global_step + 3  # print detailed breakdown 3 steps after resume/ start
+
+    def _get_rng_states():
+        try:
+            np_state = numpy.random.get_state()
+        except Exception:
+            np_state = None
+        return {
+            "python": python_random.getstate(),
+            "numpy": np_state,
+        }
+
+    def _get_batch_offset():
+        n_accum = config["training"]["gradient_accumulation_steps"]
+        return (global_step * n_accum) % len(dataloader)
 
     def _save_crash_checkpoint(tag="crash"):
         try:
@@ -520,6 +589,9 @@ def train(config: Dict[str, Any]):
                 config["training"]["output_dir"], tag,
                 total_steps=total_steps,
                 optimizers=optimizers,
+                batch_offset=_get_batch_offset(),
+                python_random_state=_get_rng_states()["python"],
+                numpy_rng_state=_get_rng_states()["numpy"],
             )
             print(f"\n  💾 Crash checkpoint saved → "
                   f"{config['training']['output_dir']}/{tag}")
@@ -531,6 +603,20 @@ def train(config: Dict[str, Any]):
         print(f"\n=== Epoch {epoch + 1}/{config['training']['epochs']} ===")
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
+
+        # Skip ahead on resume (only in the first epoch after resume)
+        if dataloader_offset > 0 and epoch == start_epoch:
+            print(f"  Skipping {dataloader_offset} batches to resume position (one-time cost)...")
+            import itertools
+            dl_iter = iter(dataloader)
+            skipped = 0
+            for _ in itertools.islice(dl_iter, dataloader_offset):
+                skipped += 1
+                if skipped % 5000 == 0:
+                    print(f"    ...{skipped}/{dataloader_offset}")
+            pbar = tqdm(dl_iter, total=len(dataloader) - dataloader_offset, desc=f"Epoch {epoch + 1}")
+            print(f"  ✓ Resumed at batch {dataloader_offset}")
+            dataloader_offset = 0
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -573,8 +659,23 @@ def train(config: Dict[str, Any]):
                 )
                 total_valid_tokens = total_valid_mask.sum().float()
 
+                # Compute decayed repr weight for this step
+                _repr_cfg = config["training"].get("repr_align", False)
+                if _repr_cfg:
+                    _rw_start = config["training"].get("repr_align_weight", 0.3)
+                    _rw_end = config["training"].get("repr_align_weight_end", 0.01)
+                    _rw_decay = config["training"].get("repr_align_decay_steps", 500)
+                    if _rw_start > 0:
+                        _progress = min(1.0, global_step / max(1, _rw_decay))
+                        cur_repr_weight = _rw_start + (_rw_end - _rw_start) * _progress
+                    else:
+                        cur_repr_weight = 0.0
+                else:
+                    cur_repr_weight = 0.0
+
                 # Step 2: Diffusion micro-batching — each chunk uses its per-block states
                 batch_loss = 0.0
+                batch_repr = 0.0
                 _t_fwd = _t_kl = _t_bwd = 0.0
                 for blk_start in range(0, B_blocks_total, diff_chunk_blocks):
                     blk_end = min(blk_start + diff_chunk_blocks, B_blocks_total)
@@ -612,14 +713,16 @@ def train(config: Dict[str, Any]):
                     if _profile: torch.cuda.synchronize(); _t_fwd += (time.perf_counter() - _tf0) * 1000
 
                     if _profile: torch.cuda.synchronize(); _tk0 = time.perf_counter()
-                    chunk_loss = compute_kl_loss(
+                    chunk_loss, chunk_repr = compute_kl_loss(
                         diff_hidden=diff_hidden,
                         ar_hidden_states=ar_hidden,
                         lm_head=model.lm_head,
                         anchor_positions=chunk_anchor,
                         K=K,
                         target_ids=chunk_target,
-                        pad_token_id=pad_token_id
+                        pad_token_id=pad_token_id,
+                        repr_weight=cur_repr_weight,
+                        repr_subsample=config["training"].get("repr_align_subsample", 0.25),
                     )
                     if _profile: torch.cuda.synchronize(); _t_kl += (time.perf_counter() - _tk0) * 1000
 
@@ -638,10 +741,12 @@ def train(config: Dict[str, Any]):
                         scaled_loss.backward()
                     if _profile: torch.cuda.synchronize(); _t_bwd += (time.perf_counter() - _tb0) * 1000
                     batch_loss += chunk_loss.item() * weight
+                    batch_repr += chunk_repr * weight
                     # Free diffusion activations immediately to prevent memory leak
                     del diff_hidden, chunk_loss, scaled_loss
 
                 accum_loss += batch_loss
+                accum_repr += batch_repr
 
                 # Free AR intermediates
                 del ar_hidden, ar_kv_cache, linear_states, per_block_la_conv
@@ -694,6 +799,9 @@ def train(config: Dict[str, Any]):
                             f"interrupt_step_{global_step}",
                             total_steps=total_steps,
                             optimizers=optimizers,
+                            batch_offset=_get_batch_offset(),
+                            python_random_state=_get_rng_states()["python"],
+                            numpy_rng_state=_get_rng_states()["numpy"],
                         )
                         print("✓ Saved. Resume with:")
                         print(f"  --resume {config['training']['output_dir']}/interrupt_step_{global_step}")
@@ -704,12 +812,17 @@ def train(config: Dict[str, Any]):
                         lr = scheduler.get_last_lr()[0]
                         n_accum = config["training"]["gradient_accumulation_steps"]
                         avg_loss = accum_loss / n_accum
+                        avg_repr = accum_repr / n_accum
+                        repr_str = ""
+                        if config["training"].get("repr_align", False):
+                            repr_str = f" | Repr: {avg_repr:.4f} (w={cur_repr_weight:.3f})"
                         pbar.write(
-                            f"  Step {global_step:6d} | Loss: {avg_loss:.4f} | "
+                            f"  Step {global_step:6d} | Loss: {avg_loss:.4f}{repr_str} | "
                             f"LR: {lr:.2e} | Grad norm: {grad_norm:.2f}"
                         )
                         log_metrics(global_step, avg_loss, lr=lr, grad_norm=grad_norm)
                         accum_loss = 0.0
+                        accum_repr = 0.0
 
                     # ── checkpoint ──────────────────────────────────────────────
                     if global_step % config["training"]["save_every"] == 0:
@@ -719,6 +832,9 @@ def train(config: Dict[str, Any]):
                             f"step_{global_step}",
                             total_steps=total_steps,
                             optimizers=optimizers,
+                            batch_offset=_get_batch_offset(),
+                            python_random_state=_get_rng_states()["python"],
+                            numpy_rng_state=_get_rng_states()["numpy"],
                         )
 
                     # ── eval ───────────────────────────────────────────────────
@@ -782,13 +898,16 @@ def train(config: Dict[str, Any]):
         config["training"]["output_dir"], "final",
         total_steps=total_steps,
         optimizers=optimizers,
+        batch_offset=_get_batch_offset(),
+        python_random_state=_get_rng_states()["python"],
+        numpy_rng_state=_get_rng_states()["numpy"],
     )
     print(f"\n✓ Training complete. Final checkpoint saved to "
           f"{os.path.join(config['training']['output_dir'], 'final')}")
     return model
 
 
-def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name, total_steps=None, optimizers=None):
+def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name, total_steps=None, optimizers=None, batch_offset=0, python_random_state=None, numpy_rng_state=None):
     """Save full training state for resumption."""
     ckpt_dir = os.path.join(output_dir, name)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -807,11 +926,20 @@ def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name, 
         opt_states = {i: opt.state_dict() for i, opt in enumerate(optimizers)}
     else:
         opt_states = optimizer.state_dict()
+    # Save RNG states for DataLoader reproducibility on resume
+    rng_state = {
+        "torch_cpu": torch.random.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "python": python_random_state,
+        "numpy": numpy_rng_state,
+    }
     torch.save({
         "optimizer": opt_states,
         "scheduler": scheduler.state_dict(),
         "step": step,
         "epoch": epoch,
+        "rng_state": rng_state,
+        "batch_offset": batch_offset,
     }, os.path.join(ckpt_dir, "trainer_state.pt"))
     # Save a sidecar with schedule metadata so batch-size changes can be handled
     if total_steps is not None:
@@ -822,8 +950,8 @@ def save_checkpoint(model, optimizer, scheduler, step, epoch, output_dir, name, 
 
 def load_checkpoint(model, optimizer, scheduler, ckpt_dir, optimizers=None):
     """Load full training state and return (start_epoch, global_step)."""
-    state = torch.load(os.path.join(ckpt_dir, "trainer_state.pt"), map_location="cpu")
-    weights = torch.load(os.path.join(ckpt_dir, "diffusion_heads.pt"), map_location="cpu")
+    state = torch.load(os.path.join(ckpt_dir, "trainer_state.pt"), map_location="cpu", weights_only=False)
+    weights = torch.load(os.path.join(ckpt_dir, "diffusion_heads.pt"), map_location="cpu", weights_only=True)
     clean_weights = {k.replace("._orig_mod", ""): v for k, v in weights.items()}
     missing, unexpected = model.load_state_dict(clean_weights, strict=False)
     diff_missing = [k for k in missing if "diffusion_heads" in k]
@@ -842,7 +970,9 @@ def load_checkpoint(model, optimizer, scheduler, ckpt_dir, optimizers=None):
     else:
         optimizer.load_state_dict(opt_state)
     # scheduler rebuilt from config - don't load stale LR
-    return state["epoch"], state["step"]
+    rng_state = state.get("rng_state")
+    batch_offset = state.get("batch_offset", 0)
+    return state["epoch"], state["step"], rng_state, batch_offset
 
 
 
@@ -893,7 +1023,7 @@ def evaluate(model, dataloader, pad_token_id, device, dtype, max_eval_batches=10
                 block_indices=torch.arange(blk_start, blk_end, device=device),
                 per_block_la_conv=per_block_la_conv,
             )
-            chunk_loss = compute_kl_loss(
+            chunk_loss, _ = compute_kl_loss(
                 diff_hidden, ar_hidden, model.lm_head,
                 anchor_positions[:, blk_start:blk_end], K,
                 target_ids[:, tok_start:tok_end], pad_token_id,
