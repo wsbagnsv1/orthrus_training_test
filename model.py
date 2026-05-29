@@ -665,7 +665,7 @@ class OrthrusQwen35Model(nn.Module):
                             for b_idx, copy_to, copy_from in duplicate_fixes:
                                 anchor_states[b_idx, copy_to] = anchor_states[b_idx, copy_from]
 
-                        linear_states[li] = anchor_states
+                        linear_states[li] = anchor_states.to(torch.bfloat16)
 
                         # Conv state per anchor: [B, num_anchors, C, ks] buffer per layer
                         # Use Triton kernel for GPU-resident extraction (no CPU-GPU sync)
@@ -798,6 +798,8 @@ class OrthrusQwen35Model(nn.Module):
                     position_embeddings, ar_past_key_values,
                     ar_seq_len, causal_limit, K,
                     grp_start,
+                    linear_states, block_indices,
+                    per_block_fa_kv, per_block_la_conv,
                     use_reentrant=False,
                 )
         else:
@@ -1080,6 +1082,8 @@ def _run_diffusion_layers(
     causal_limit: Tensor,
     block_size: int,
     start_idx: int,
+    linear_states=None, block_indices=None, 
+    per_block_fa_kv=None, per_block_la_conv=None,
 ) -> Tensor:
     """Process a group of layers (for gradient checkpointing)."""
     for local_idx, (layer, diff_head) in enumerate(zip(layers, diff_heads)):
@@ -1094,6 +1098,10 @@ def _run_diffusion_layers(
             causal_limit=causal_limit,
             block_size=block_size,
             layer_idx=layer_idx,
+            linear_states=linear_states,
+            block_indices=block_indices,
+            per_block_fa_kv=per_block_fa_kv,
+            per_block_la_conv=per_block_la_conv,
         )
     return hidden_states
 

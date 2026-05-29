@@ -98,8 +98,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "lr_scheduler": "cosine",
         "warmup_ratio": 0.05,
         "gradient_clip": 1.0,
-        "micro_batch_size": 4,
-        "gradient_accumulation_steps": 8,   # effective batch = 32
+        "micro_batch_size": 1,
+        "gradient_accumulation_steps": 32,   # effective batch = 32
         "precision": "bfloat16",
         "compile": True,
         "optimizer": "adamw",      # "adamw" or "muon"
@@ -191,7 +191,12 @@ def compute_kl_loss(
     if total_tokens == 0:
         return torch.tensor(0.0, device=device, requires_grad=not forward_only)
 
-    s_chunk = diff_hidden[batch_idx, diff_pos]
+    # FIX: Align student and teacher predictions.
+    # The student uses the hidden state *before* processing the mask to predict it,
+    # so we shift the student's gathered hidden states by -1.
+    # The teacher uses ar_pos (which starts at anchor 'a') to predict 'a+1', which is correct.
+    student_pos = diff_pos - 1  # Local index: 0, 1, ... (predicts 1, 2, ...)
+    s_chunk = diff_hidden[batch_idx, student_pos]
     t_chunk = ar_hidden_states[batch_idx, ar_pos]
 
     valid_flat = valid.reshape(-1)
