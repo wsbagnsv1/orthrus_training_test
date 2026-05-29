@@ -9,4 +9,4 @@ einops
 tqdm>=4.67.0
 pyyaml
 wandb                 # Optional logging
-muon
+muon-optimizer==0.1.0
