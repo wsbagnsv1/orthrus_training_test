@@ -331,9 +331,10 @@ def generate_colored(
         )  # [1, diff_len, vocab]
         total_forward_passes += 1
 
-        # Sample from positions 1..K-1 → predictions for tokens after anchor
+        # Sample from positions 0..K-2 -> predictions for tokens 1..K-1 (the masks)
+        # Standard causal logic: logit[t] predicts token[t+1]
         if diff_len > 1:
-            diff_tokens, diff_probs = sample_token(diff_logits[:, 1:, :], temperature)
+            diff_tokens, diff_probs = sample_token(diff_logits[:, :diff_len-1, :], temperature)
             # diff_tokens: [1, K-1]
         else:
             diff_tokens = torch.empty((1, 0), dtype=torch.long, device=device)

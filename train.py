@@ -1273,8 +1273,10 @@ def evaluate_acceptance_rate(
                     )
                     total_passes += 1
 
+                    # Standard causal logic: logit[t] predicts token[t+1]
+                    # We use logit[0..K-2] to predict masks at 1..K-1
                     if diff_len > 1:
-                        diff_preds = diff_logits[0, 1:].argmax(dim=-1).tolist()
+                        diff_preds = diff_logits[0, :diff_len-1].argmax(dim=-1).tolist()
                     else:
                         diff_preds = []
                     proposed = [anchor_token] + diff_preds
