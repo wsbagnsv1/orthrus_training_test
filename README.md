@@ -1,4 +1,4 @@
-This code is an working implementation of the orthrus papers trainingcode. 
+This code is an probably working implementation of the orthrus papers trainingcode. 
 It is not yet fully validated at scale and might not be fully optimized but overall it should mostly work. 
 I trained a the 130m smollm2 on the smoltalk dataset and dtrained it at effective batch size 64 to 6000 steps and got this performance out of it:
 
