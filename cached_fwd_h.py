@@ -23,7 +23,9 @@ def cached_fwd_h(k, w, u, g, **kwargs):
     If called during backward (cache exists), return cached h, v_new.
     If called during forward, compute normally and cache the result.
     """
-    cache_key = id(k)  # Use tensor id as cache key
+    # Use id(k) for caching. PyTorch's autograd preserves tensor object identity
+    # between forward and backward passes, making this stable and naturally scoped per-step.
+    cache_key = id(k)
     
     # Check if we have cached results for this forward pass
     if cache_key in _cache:
@@ -35,8 +37,7 @@ def cached_fwd_h(k, w, u, g, **kwargs):
     
     # Cache for backward (only if gradients enabled)
     if torch.is_grad_enabled():
-        # Store with k's id as key
-        _cache[id(k)] = (h.detach().requires_grad_(True), v_new.detach().requires_grad_(True))
+        _cache[cache_key] = (h.detach().requires_grad_(True), v_new.detach().requires_grad_(True))
     
     return h, v_new, final_state
 

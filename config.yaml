@@ -14,23 +14,23 @@ training:
   lr_scheduler: "cosine"
   warmup_ratio: 0.05
   gradient_clip: 1.0
-  micro_batch_size: 4
-  gradient_accumulation_steps: 8  # effective batch = 32
+  micro_batch_size: 1
+  gradient_accumulation_steps: 32  # effective batch = 32
   precision: "bfloat16"
   compile: false
   optimizer: "muon"          # "adamw" or "muon"
-  muon_lr_multiplier: 66.7     # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+  muon_lr_multiplier: 10.0      # Muon LR = peak_lr × multiplier
   weight_decay: 0.0         # AdamW weight decay (norms under Muon)
   muon_weight_decay: 0.0    # Muon weight decay (paper recommends 0.01–0.1)
-  diffusion_chunk_blocks: 16  # spatial micro-batching
+  diffusion_chunk_blocks: 32  # spatial micro-batching
   eval_batch_size: 1            # smaller to avoid OOM during eval
   teacher_bf16: true          # bf16 storage, fp32 accumulation
 
   # Representation alignment aux loss (cosine sim on hidden states)
-  repr_align: false            # tracks repr even at weight 0
-  repr_align_weight: 0.0       # set >0 to add to loss (e.g. 0.3)
-  repr_align_weight_end: 0.01  # final weight (KL takes over)
-  repr_align_decay_steps: 500  # linear decay over this many steps
+  repr_align: false            # disabled
+  repr_align_weight: 0.15      # starting weight
+  repr_align_weight_end: 0.0   # decays completely to 0
+  repr_align_decay_steps: 1500 # linear decay over this many steps
   repr_align_subsample: 0.25   # fraction of valid tokens to subsample
 
   # Logging & checkpointing

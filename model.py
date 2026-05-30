@@ -75,6 +75,9 @@ try:
 except ImportError:
     FUSED_KERNEL_AVAILABLE = False
 
+# ── Toggle: Switch between SDPA Residual and Bidirectional GDN ──
+USE_BI_GDN = True   # Set to True to enable Bi-GDN; False uses SDPA residual
+
 # ── Custom attention kernel (replaces FlexAttention) ──────────────────────
 from ortho_attention import ortho_attention
 
@@ -415,20 +418,43 @@ class DiffusionLinearAttention(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
 
-        # ── Residual Local Bidirectional SDPA ────────────────────────────
-        v_local = beta.unsqueeze(-1).to(value.dtype) * value
+        # ── Bidirectional Logic Switch ─────────────────────────────────────
+        if USE_BI_GDN:
+            # Bi-GDN: Backward pass (Anti-causal)
+            # Flip sequence dimension (dim 1)
+            q_bwd = query.flip(1)
+            k_bwd = key.flip(1)
+            v_bwd = value.flip(1)
+            g_bwd = g.flip(1)
+            beta_bwd = beta.flip(1)
+            
+            # Run GDN backward without AR state (purely intra-block)
+            # We use the standard chunk rule here to avoid fused kernel complexity
+            out_bwd, _ = self.chunk_gated_delta_rule(
+                q_bwd, k_bwd, v_bwd,
+                g=g_bwd, beta=beta_bwd,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            
+            # Flip back and add to forward output
+            core_attn_out = core_attn_out + out_bwd.flip(1)
+        else:
+            # Old SDPA Residual
+            v_local = beta.unsqueeze(-1).to(value.dtype) * value
 
-        q_sdpa = query.transpose(1, 2)   # [B, Hv, T, Kd]
-        k_sdpa = key.transpose(1, 2)     # [B, Hv, T, Kd]
-        v_sdpa = v_local.transpose(1, 2) # [B, Hv, T, Vd]
-        
-        o_local = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa, is_causal=False
-        )
-        o_local = o_local * self.gate_local
-        o_local = o_local.transpose(1, 2)  # [B, T, Hv, Vd]
-        
-        core_attn_out = core_attn_out + o_local
+            q_sdpa = query.transpose(1, 2)   # [B, Hv, T, Kd]
+            k_sdpa = key.transpose(1, 2)     # [B, Hv, T, Kd]
+            v_sdpa = v_local.transpose(1, 2) # [B, Hv, T, Vd]
+            
+            o_local = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, is_causal=False
+            )
+            o_local = o_local * self.gate_local
+            o_local = o_local.transpose(1, 2)  # [B, T, Hv, Vd]
+            
+            core_attn_out = core_attn_out + o_local
 
         # ── Norm + Gate + Output ─────────────────────────────────────────
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -548,7 +574,7 @@ class OrthrusQwen35Model(nn.Module):
         # Build batched anchor_mask: (B, seq_len) int32, -1 = not anchor, else anchor_idx
         # Each batch element gets its own anchor positions (fixes P0 shared-row-0 bug)
         #
-        # IMPORTANT: We extract the recurrent state at position (pos - 2) which is
+        # IMPORTANT: We extract the recurrent state at position (pos - 1) which is
         # ONE POSITION BEFORE the anchor. This ensures:
         #   - recurrent_state = state after processing tokens BEFORE anchor
         #   - The diffusion block then processes the anchor as its first token

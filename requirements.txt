@@ -1,12 +1,14 @@
-torch>=2.12.0
-triton>=3.7.0
+torch==2.12.0.dev20260408+cu128
+triton-windows==3.7.0.post26
 transformers==5.7.0
-datasets>=3.6.0
-flash-linear-attention>=0.5.0
-liger-kernel>=0.8.0
-accelerate
-einops
-tqdm>=4.67.0
-pyyaml
-wandb                 # Optional logging
+datasets==3.6.0
+flash-linear-attention==0.5.0
+fla-core==0.5.0
+liger-kernel @ git+https://github.com/linkedin/Liger-Kernel.git@bfaaef8b56b91bf9e18893597e04acd32be51326
 muon-optimizer==0.1.0
+tqdm==4.67.1
+PyYAML==6.0.2
+numpy==2.4.4
+safetensors==0.6.2
+huggingface_hub==1.12.0
+accelerate==1.13.0

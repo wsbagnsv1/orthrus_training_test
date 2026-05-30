@@ -103,7 +103,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "precision": "bfloat16",
         "compile": True,
         "optimizer": "adamw",      # "adamw" or "muon"
-        "muon_lr_multiplier": 66.7,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
+        "muon_lr_multiplier": 10.0,  # Muon LR = peak_lr × multiplier (norms keep peak_lr)
         "weight_decay": 0.0,       # AdamW weight decay (also applies to norm params under Muon)
         "muon_weight_decay": 0.0,  # Muon weight decay (recommended 0.01–0.1)
         "log_every": 1,
@@ -115,7 +115,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "teacher_bf16": True,
         "repr_align": False,           # enable representation alignment aux loss
         "repr_align_weight": 0.3,      # starting weight (decayed over training)
-        "repr_align_weight_end": 0.01, # final weight after decay
+        "repr_align_weight_end": 0.0, # final weight after decay (defaults to 0)
         "repr_align_decay_steps": 500, # linearly decay weight over this many steps
         "repr_align_subsample": 0.25,  # fraction of valid tokens to subsample
     },
@@ -213,7 +213,7 @@ def compute_kl_loss(
         else:
             kl_mean = triton_compute_kl_loss(s_valid, t_valid, lm_head.weight)
 
-        loss = kl_mean * (s_valid.size(0) / total_tokens)
+        loss = kl_mean # Simply mean KL per valid token, no padding math
         repr_val = 0.0
 
         # ── representation alignment aux loss ───────────────────────────
@@ -451,7 +451,7 @@ def train(config: Dict[str, Any]):
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
+            if any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj", "fused_proj", "out_proj")):
                 proj_params.append(p)
             else:
                 norm_params.append(p)
@@ -668,7 +668,7 @@ def train(config: Dict[str, Any]):
                 _repr_cfg = config["training"].get("repr_align", False)
                 if _repr_cfg:
                     _rw_start = config["training"].get("repr_align_weight", 0.3)
-                    _rw_end = config["training"].get("repr_align_weight_end", 0.01)
+                    _rw_end = config["training"].get("repr_align_weight_end", 0.0)
                     _rw_decay = config["training"].get("repr_align_decay_steps", 500)
                     if _rw_start > 0:
                         _progress = min(1.0, global_step / max(1, _rw_decay))
@@ -731,12 +731,9 @@ def train(config: Dict[str, Any]):
                     )
                     if _profile: torch.cuda.synchronize(); _t_kl += (time.perf_counter() - _tk0) * 1000
 
-                    # Weight by actual valid token count - invariant to chunk size
-                    if total_valid_tokens > 0 and chunk_valid_tokens > 0:
-                        weight = chunk_valid_tokens / total_valid_tokens
-                    else:
-                        weight = 0.0
-                    scaled_loss = (chunk_loss * weight) / config["training"]["gradient_accumulation_steps"]
+                    # Clean accumulation: Every chunk contributes its pure Mean KL
+                    # No weighting needed: The Mean KL is already normalized per valid token
+                    scaled_loss = chunk_loss / config["training"]["gradient_accumulation_steps"]
 
                     # Backward immediately - frees diffusion activations for this chunk
                     if _profile: torch.cuda.synchronize(); _tb0 = time.perf_counter()
@@ -745,13 +742,15 @@ def train(config: Dict[str, Any]):
                     else:
                         scaled_loss.backward()
                     if _profile: torch.cuda.synchronize(); _t_bwd += (time.perf_counter() - _tb0) * 1000
-                    batch_loss += chunk_loss.item() * weight
-                    batch_repr += chunk_repr * weight
+                    batch_loss += chunk_loss.item()
+                    batch_repr += chunk_repr
                     # Free diffusion activations immediately to prevent memory leak
                     del diff_hidden, chunk_loss, scaled_loss
 
-                accum_loss += batch_loss
-                accum_repr += batch_repr
+                # Average the chunk losses for accurate per-token reporting
+                n_chunks = max(1, math.ceil(B_blocks_total / diff_chunk_blocks))
+                accum_loss += batch_loss / n_chunks
+                accum_repr += batch_repr / n_chunks
 
                 # Free AR intermediates
                 del ar_hidden, ar_kv_cache, linear_states, per_block_la_conv
@@ -777,9 +776,18 @@ def train(config: Dict[str, Any]):
                         for opt in optimizers:
                             opt.step()
 
-                    scheduler.step()
+                    # Apply learning rate schedule across ALL active optimizers (fixes Muon norm optimizer skip)
+                    curr_lr_mult = _lr_fn(schedule_step)
+                    for opt in optimizers:
+                        for pg in opt.param_groups:
+                            pg['lr'] = pg['initial_lr'] * curr_lr_mult
+
                     for opt in optimizers:
                         opt.zero_grad(set_to_none=True)
+                    
+                    # Update legacy scheduler state (LambdaLR) for compatibility/resume safety
+                    # (The LR is already set correctly above, this just advances its internal epoch counter)
+                    scheduler.step()
 
                     global_step += 1
                     schedule_step += 1
